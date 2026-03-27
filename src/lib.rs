@@ -289,25 +289,17 @@ impl<R: Reader> Archive<R> {
         self.entry_count
     }
 
-    /// Returns a forward-only iterator over central-directory entries.
+    /// Iterate over [Entries](Entry) (files) declared in the zip archive's central directory.
     ///
     /// The iterator performs no allocation and stops permanently after the
     /// first parse error.
     pub fn entries(&self) -> Entries<'_, R> {
         Entries {
             archive: self,
-            next_offset: self.absolute_central_directory_offset(),
+            next_offset: self.base_offset + self.central_directory_offset,
             remaining: self.entry_count,
             end_offset: self.directory_end_offset,
         }
-    }
-
-    fn absolute_central_directory_offset(&self) -> u64 {
-        self.base_offset + self.central_directory_offset
-    }
-
-    fn absolute_local_offset(&self, local_offset: u64) -> Result<u64, Error<R::Error>> {
-        add(self.base_offset, local_offset)
     }
 
     fn read_exact_at(&self, pos: u64, buf: &mut [u8]) -> Result<(), Error<R::Error>> {
@@ -562,9 +554,7 @@ impl<'a, R: Reader> Entry<'a, R> {
             return Err(Error::StrongEncryption);
         }
 
-        let local_header_offset = self
-            .archive
-            .absolute_local_offset(self.local_header_offset)?;
+        let local_header_offset = add(self.archive.base_offset, self.local_header_offset)?;
         let mut header = [0u8; LOCAL_HEADER_LEN];
         self.archive
             .read_exact_at(local_header_offset, &mut header)?;

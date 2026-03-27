@@ -379,16 +379,17 @@ fn synthetic_filename_is_reads_only_needed_suffix_bytes() {
 }
 
 #[test]
-fn synthetic_path_is_utf8_distinguishes_raw_bytes() {
-    let valid = simple_stored_zip(b"dir/hello.txt", b"payload");
-    let valid_archive = Archive::open(valid.as_slice()).unwrap();
-    let valid_entry = valid_archive.entries().next().unwrap().unwrap();
-    assert!(valid_entry.path_is_utf8().unwrap());
+fn synthetic_path_is_utf8_trusts_zip_flag() {
+    let plain = simple_stored_zip(b"dir/hello.txt", b"payload");
+    let plain_archive = Archive::open(plain.as_slice()).unwrap();
+    let plain_entry = plain_archive.entries().next().unwrap().unwrap();
+    assert!(!plain_entry.path_is_utf8());
 
-    let invalid = simple_stored_zip(b"dir/\xFF.txt", b"payload");
-    let invalid_archive = Archive::open(invalid.as_slice()).unwrap();
-    let invalid_entry = invalid_archive.entries().next().unwrap().unwrap();
-    assert!(!invalid_entry.path_is_utf8().unwrap());
+    let mut flagged = simple_stored_zip(b"dir/\xFF.txt", b"payload");
+    set_utf8_flags(&mut flagged, b"dir/\xFF.txt", b"payload");
+    let flagged_archive = Archive::open(flagged.as_slice()).unwrap();
+    let flagged_entry = flagged_archive.entries().next().unwrap().unwrap();
+    assert!(flagged_entry.path_is_utf8());
 }
 
 fn fail_reason(bytes: &[u8], path: &str) -> Option<String> {
@@ -719,6 +720,12 @@ fn simple_stored_zip(name: &[u8], data: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&to_u32(cd_offset).to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes());
     out
+}
+
+fn set_utf8_flags(zip: &mut [u8], name: &[u8], data: &[u8]) {
+    zip[7] |= 0x08;
+    let central_offset = 30 + name.len() + data.len();
+    zip[central_offset + 9] |= 0x08;
 }
 
 fn range_len(range: &std::ops::Range<u64>) -> u64 {

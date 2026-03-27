@@ -32,8 +32,8 @@ fn inspect<R: Reader>(reader: R) -> Result<(), tinyzip::Error<R::Error>> {
         let entry = entry?;
         let mut name = [0u8; 64];
         let path = entry.read_path(&mut name)?;
-        let path_text = if entry.path_is_utf8()? {
-            Some(core::str::from_utf8(path).expect("path_is_utf8 checked"))
+        let path_text = if entry.path_is_utf8() {
+            Some(core::str::from_utf8(path).expect("path_is_utf8 comes from the ZIP UTF-8 flag"))
         } else {
             None
         };
@@ -54,6 +54,6 @@ The API stays low-level on purpose:
 - `Entry` borrows the archive and holds one parsed central-directory record.
 - ZIP paths are exposed as raw bytes; they may be nested `/`-separated paths,
   bare file names, or directory markers ending in `/`.
-- `Entry::path_is_utf8()` lets callers validate path bytes before decoding.
+- `Entry::path_is_utf8()` exposes whether the ZIP metadata marks the path as UTF-8.
 - Variable-length fields are read into caller-provided buffers.
 - Data location is resolved lazily from the local header only when needed.

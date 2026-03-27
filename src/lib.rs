@@ -521,8 +521,8 @@ impl<'a, R: Reader> Entry<'a, R> {
     ///
     /// ZIP stores a single byte string here rather than a structured path. It
     /// may be just a bare file name, a `/`-separated nested path, or a
-    /// directory marker ending in `/`. Use [`Self::path_is_utf8`] before
-    /// decoding if you need to know whether the raw bytes form valid UTF-8.
+    /// directory marker ending in `/`. Use [`Self::path_is_utf8`] to check
+    /// whether the central-directory metadata declares this path as UTF-8.
     ///
     /// `buf` must be large enough to hold the full stored path. The returned
     /// slice borrows `buf` and is exactly the bytes read from the archive.
@@ -535,55 +535,14 @@ impl<'a, R: Reader> Entry<'a, R> {
         read_variable_range(self.archive, self.name_range.clone(), buf)
     }
 
-    /// Returns whether the entry path bytes are valid UTF-8.
+    /// Returns whether the central-directory general-purpose bit flag declares
+    /// the entry path to be UTF-8 encoded.
     ///
-    /// This reads the stored path in small chunks and validates the byte stream
-    /// incrementally. It does not allocate or normalize the path.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Format`] if the stored path range is inconsistent, and
-    /// [`Error::Io`] if the underlying reads fail.
-    pub fn path_is_utf8(&self) -> Result<bool, Error<R::Error>> {
-        let mut scratch = [0u8; PATH_SCAN_CHUNK_LEN + 4];
-        let mut path_offset = self.name_range.start;
-        let mut carry_len = 0usize;
-
-        while path_offset < self.name_range.end {
-            let remaining = self
-                .name_range
-                .end
-                .checked_sub(path_offset)
-                .ok_or(Error::Format(FormatError::Bounds))?;
-            let chunk_len = usize::try_from(remaining.min(PATH_SCAN_CHUNK_LEN as u64))
-                .map_err(|_| Error::Format(FormatError::Bounds))?;
-            self.archive
-                .read_exact_at(path_offset, &mut scratch[carry_len..carry_len + chunk_len])?;
-
-            let total_len = carry_len + chunk_len;
-            match core::str::from_utf8(&scratch[..total_len]) {
-                Ok(_) => {
-                    carry_len = 0;
-                }
-                Err(err) => {
-                    if err.error_len().is_some() {
-                        return Ok(false);
-                    }
-                    let valid_up_to = err.valid_up_to();
-                    let trailing = total_len
-                        .checked_sub(valid_up_to)
-                        .ok_or(Error::Format(FormatError::Bounds))?;
-                    scratch.copy_within(valid_up_to..total_len, 0);
-                    carry_len = trailing;
-                }
-            }
-
-            path_offset = path_offset
-                .checked_add(u64::try_from(chunk_len).map_err(|_| Error::Format(FormatError::Bounds))?)
-                .ok_or(Error::Format(FormatError::Bounds))?;
-        }
-
-        Ok(carry_len == 0)
+    /// The result comes from bit 11 of the central-directory general-purpose
+    /// flag. It does not inspect or validate the path bytes themselves.
+    #[must_use]
+    pub fn path_is_utf8(&self) -> bool {
+        self.flags & (1 << 11) != 0
     }
 
     /// Returns whether the final `/`-separated component of the entry path

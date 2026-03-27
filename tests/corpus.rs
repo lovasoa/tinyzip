@@ -1,11 +1,9 @@
-use std::fs;
 use std::cell::Cell;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::vec::Vec;
 
-use tinyzip::{
-    Archive, Compression, DataKind, Error, FormatError, Reader, SliceReaderError, Unsupported,
-};
+use tinyzip::{Archive, Compression, DataKind, Error, Reader, SliceReaderError};
 
 const VALID_ROOT: &str = "tests/data/valid";
 const INVALID_ROOT: &str = "tests/data/invalid";
@@ -17,10 +15,7 @@ struct CountingReader<'a> {
 
 impl<'a> CountingReader<'a> {
     fn new(bytes: &'a [u8], bytes_read: &'a Cell<u64>) -> Self {
-        Self {
-            bytes,
-            bytes_read,
-        }
+        Self { bytes, bytes_read }
     }
 }
 
@@ -49,7 +44,7 @@ struct Fixture {
 }
 
 enum Expected {
-    Reject(FormatError),
+    Reject(Error<()>),
     Accept {
         entry_count: u64,
         entries: &'static [ExpectedEntry],
@@ -167,7 +162,7 @@ const MANUAL_FIXTURES: &[Fixture] = &[
     Fixture {
         name: "readme.notzip",
         path: "tests/data/manual/go-archive-zip/readme.notzip",
-        expected: Expected::Reject(FormatError::NotZip),
+        expected: Expected::Reject(Error::NotZip),
     },
     Fixture {
         name: "test-baddirsz.zip",
@@ -194,7 +189,7 @@ fn manual_inspected_corpus() {
             Expected::Reject(kind) => {
                 let err = open_fixture_expect_err(fixture.path);
                 assert_eq!(
-                    format_err(&err),
+                    structural_err(&err),
                     *kind,
                     "fixture {}: expected open error {:?}, got {:?}",
                     fixture.name,
@@ -202,7 +197,10 @@ fn manual_inspected_corpus() {
                     err
                 );
             }
-            Expected::Accept { entry_count, entries } => {
+            Expected::Accept {
+                entry_count,
+                entries,
+            } => {
                 let bytes = read_fixture(fixture.path);
                 let archive = open_archive(&bytes, fixture.path);
                 assert_archive_meta(fixture.name, &archive, *entry_count);
@@ -315,10 +313,7 @@ fn synthetic_multidisk_is_rejected() {
     let mut bytes = empty_zip();
     bytes[4] = 1;
     let err = Archive::open(bytes.as_slice()).err().unwrap();
-    assert_eq!(
-        format_err(&err),
-        FormatError::Unsupported(Unsupported::MultiDisk)
-    );
+    assert_eq!(structural_err(&err), Error::MultiDisk);
 }
 
 #[test]
@@ -326,7 +321,7 @@ fn synthetic_truncated_eocd_is_rejected() {
     let mut bytes = empty_zip();
     bytes.pop();
     let err = Archive::open(bytes.as_slice()).err().unwrap();
-    assert_eq!(format_err(&err), FormatError::NotZip);
+    assert_eq!(structural_err(&err), Error::NotZip);
 }
 
 #[test]
@@ -336,10 +331,7 @@ fn synthetic_encrypted_entry_is_rejected_on_data_access() {
     let archive = Archive::open(bytes.as_slice()).unwrap();
     let entry = archive.entries().next().unwrap().unwrap();
     let err = entry.data_range().unwrap_err();
-    assert_eq!(
-        format_err(&err),
-        FormatError::Unsupported(Unsupported::StrongEncryption)
-    );
+    assert_eq!(structural_err(&err), Error::StrongEncryption);
 }
 
 #[test]
@@ -350,7 +342,7 @@ fn synthetic_truncated_local_header_is_rejected_on_data_access() {
     let archive = Archive::open(bytes.as_slice()).unwrap();
     let entry = archive.entries().next().unwrap().unwrap();
     let err = entry.data_range().unwrap_err();
-    assert_eq!(format_err(&err), FormatError::Truncated);
+    assert_eq!(structural_err(&err), Error::Truncated);
 }
 
 #[test]
@@ -459,11 +451,7 @@ fn open_archive<'a>(bytes: &'a [u8], label: &str) -> Archive<&'a [u8]> {
         .unwrap_or_else(|err| panic!("fixture {label}: expected archive to open, got {err:?}"))
 }
 
-fn assert_archive_meta(
-    label: &str,
-    archive: &Archive<&[u8]>,
-    expected_entry_count: u64,
-) {
+fn assert_archive_meta(label: &str, archive: &Archive<&[u8]>, expected_entry_count: u64) {
     assert_eq!(
         archive.entry_count(),
         expected_entry_count,
@@ -484,9 +472,7 @@ fn next_entry<'a>(
         Some(Err(err)) => panic!(
             "fixture {label} entry {entry_index}: expected entry, got iterator error {err:?}"
         ),
-        None => panic!(
-            "fixture {label} entry {entry_index}: expected entry, iterator ended early"
-        ),
+        None => panic!("fixture {label} entry {entry_index}: expected entry, iterator ended early"),
     }
 }
 
@@ -610,17 +596,13 @@ fn assert_coherent_data_range(
     );
 }
 
-fn entry_name(
-    label: &str,
-    entry_index: u64,
-    entry: &tinyzip::Entry<'_, &[u8]>,
-) -> Vec<u8> {
+fn entry_name(label: &str, entry_index: u64, entry: &tinyzip::Entry<'_, &[u8]>) -> Vec<u8> {
     let mut name_buf = vec![0u8; PATH_BUF_LEN];
     match entry.read_path(&mut name_buf) {
         Ok(name) => name.to_vec(),
-        Err(err) => panic!(
-            "fixture {label} entry {entry_index}: failed to read path bytes: {err:?}"
-        ),
+        Err(err) => {
+            panic!("fixture {label} entry {entry_index}: failed to read path bytes: {err:?}")
+        }
     }
 }
 
@@ -644,10 +626,19 @@ fn entry_data_range(
     }
 }
 
-fn format_err<E>(err: &Error<E>) -> FormatError {
+fn structural_err<E>(err: &Error<E>) -> Error<()> {
     match err {
         Error::Io(_) => panic!("unexpected I/O error"),
-        Error::Format(kind) => *kind,
+        Error::NotZip => Error::NotZip,
+        Error::Truncated => Error::Truncated,
+        Error::InvalidSignature => Error::InvalidSignature,
+        Error::InvalidOffset => Error::InvalidOffset,
+        Error::InvalidRecord => Error::InvalidRecord,
+        Error::Bounds => Error::Bounds,
+        Error::MultiDisk => Error::MultiDisk,
+        Error::StrongEncryption => Error::StrongEncryption,
+        Error::MaskedLocalHeaders => Error::MaskedLocalHeaders,
+        Error::UnsupportedCompression(method) => Error::UnsupportedCompression(*method),
     }
 }
 

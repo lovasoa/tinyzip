@@ -82,9 +82,7 @@ impl Reader for &[u8] {
         let end = pos
             .checked_add(buf.len())
             .ok_or(SliceReaderError::OutOfBounds)?;
-        let src = self
-            .get(pos..end)
-            .ok_or(SliceReaderError::OutOfBounds)?;
+        let src = self.get(pos..end).ok_or(SliceReaderError::OutOfBounds)?;
         buf.copy_from_slice(src);
         Ok(())
     }
@@ -94,29 +92,6 @@ impl Reader for &[u8] {
 /// `std` adapters for [`Reader`].
 pub mod std_io;
 
-/// Returns whether the last `/`-separated path component in `path` equals `file_name`.
-///
-/// ZIP stores entry names as a single byte string. Most producers use `/` as a
-/// separator for nested paths and end directory entries with `/`. This helper
-/// does not decode text, normalize separators, or resolve `.` / `..`; it only
-/// compares the final component after the last `/`.
-///
-/// # Examples
-///
-/// ```
-/// assert!(tinyzip::path_file_name_eq(b"dir/file.txt", b"file.txt"));
-/// assert!(!tinyzip::path_file_name_eq(b"dir/file.txt", b"dir"));
-/// assert!(tinyzip::path_file_name_eq(b"dir/", b""));
-/// ```
-#[must_use]
-pub fn path_file_name_eq(path: &[u8], file_name: &[u8]) -> bool {
-    let component = match path.iter().rposition(|&byte| byte == b'/') {
-        Some(index) => &path[index + 1..],
-        None => path,
-    };
-    component == file_name
-}
-
 /// ZIP compression methods exposed by the central directory.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Compression {
@@ -124,19 +99,16 @@ pub enum Compression {
     Stored,
     /// Method 8: the data bytes are deflate-compressed.
     Deflated,
-    /// Any other method id. The crate still reports ranges but does not
-    /// interpret the payload.
-    Unsupported(u16),
 }
 
 impl Compression {
     /// Converts a raw ZIP method id into the low-level enum used by the crate.
     #[must_use]
-    pub fn from_raw(raw: u16) -> Self {
+    pub fn from_raw(raw: u16) -> Option<Self> {
         match raw {
-            0 => Self::Stored,
-            8 => Self::Deflated,
-            other => Self::Unsupported(other),
+            0 => Some(Self::Stored),
+            8 => Some(Self::Deflated),
+            _ => None,
         }
     }
 
@@ -146,7 +118,6 @@ impl Compression {
         match self {
             Self::Stored => 0,
             Self::Deflated => 8,
-            Self::Unsupported(raw) => raw,
         }
     }
 }
@@ -178,20 +149,11 @@ pub struct DataRange {
     pub kind: DataKind,
 }
 
-/// ZIP features this crate rejects structurally.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Unsupported {
-    /// Split or multi-disk archives.
-    MultiDisk,
-    /// Strong encryption markers in central or local headers.
-    StrongEncryption,
-    /// Masked local headers, which hide required local metadata.
-    MaskedLocalHeaders,
-}
-
-/// Structural ZIP parse failures.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FormatError {
+/// Top-level parser error.
+#[derive(Debug, Eq, PartialEq)]
+pub enum Error<E> {
+    /// Error returned by the underlying [`Reader`].
+    Io(E),
     /// No EOCD record was found in the allowed scan window.
     NotZip,
     /// A required record or payload extends past the end of the archive.
@@ -204,24 +166,47 @@ pub enum FormatError {
     InvalidRecord,
     /// Arithmetic overflow or a value that cannot fit the required in-memory type.
     Bounds,
-    /// The archive uses a ZIP feature this crate intentionally does not support.
-    Unsupported(Unsupported),
-}
-
-/// Top-level parser error.
-#[derive(Debug, Eq, PartialEq)]
-pub enum Error<E> {
-    /// Error returned by the underlying [`Reader`].
-    Io(E),
-    /// ZIP structure or policy error detected by the parser.
-    Format(FormatError),
+    /// Split or multi-disk archives.
+    MultiDisk,
+    /// Strong encryption markers in central or local headers.
+    StrongEncryption,
+    /// Masked local headers, which hide required local metadata.
+    MaskedLocalHeaders,
+    /// A compression method the crate does not support.
+    UnsupportedCompression(u16),
 }
 
 impl<E: fmt::Display> fmt::Display for Error<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(err) => write!(f, "I/O error: {err}"),
-            Self::Format(err) => write!(f, "ZIP format error: {err:?}"),
+            Self::NotZip => f.write_str("not a ZIP archive"),
+            Self::Truncated => f.write_str("truncated ZIP archive"),
+            Self::InvalidSignature => f.write_str("invalid ZIP signature"),
+            Self::InvalidOffset => f.write_str("invalid ZIP offset"),
+            Self::InvalidRecord => f.write_str("invalid ZIP record"),
+            Self::Bounds => f.write_str("ZIP bounds error"),
+            Self::MultiDisk => f.write_str("multi-disk ZIP archives are unsupported"),
+            Self::StrongEncryption => f.write_str("strong encryption is unsupported"),
+            Self::MaskedLocalHeaders => f.write_str("masked local headers are unsupported"),
+            Self::UnsupportedCompression(method) => {
+                write!(f, "unsupported ZIP compression method {method}")
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StructuralError {
+    InvalidRecord,
+    Bounds,
+}
+
+impl<E> From<StructuralError> for Error<E> {
+    fn from(value: StructuralError) -> Self {
+        match value {
+            StructuralError::InvalidRecord => Self::InvalidRecord,
+            StructuralError::Bounds => Self::Bounds,
         }
     }
 }
@@ -248,13 +233,16 @@ impl<R: Reader> Archive<R> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] for reader failures and [`Error::Format`] when the
-    /// archive structure is unsupported or malformed.
+    /// Returns [`Error::Io`] for reader failures and a structural [`Error`]
+    /// variant when the archive structure is unsupported or malformed.
     pub fn open(reader: R) -> Result<Self, Error<R::Error>> {
         let size = reader.size().map_err(Error::Io)?;
         let (eocd_offset, eocd) = find_eocd(&reader, size)?;
 
-        ensure_single_disk(u32::from(eocd.disk_number), u32::from(eocd.central_directory_disk))?;
+        ensure_single_disk(
+            u32::from(eocd.disk_number),
+            u32::from(eocd.central_directory_disk),
+        )?;
 
         let (entry_count, central_directory_size, central_directory_offset, payload_end) =
             if eocd.needs_zip64() {
@@ -277,10 +265,8 @@ impl<R: Reader> Archive<R> {
 
         let used = central_directory_offset
             .checked_add(central_directory_size)
-            .ok_or(Error::Format(FormatError::Bounds))?;
-        let inferred_base_offset = payload_end
-            .checked_sub(used)
-            .ok_or(Error::Format(FormatError::InvalidOffset))?;
+            .ok_or(Error::Bounds)?;
+        let inferred_base_offset = payload_end.checked_sub(used).ok_or(Error::InvalidOffset)?;
         let absolute_cd_offset = resolve_central_directory_offset(
             &reader,
             size,
@@ -289,16 +275,19 @@ impl<R: Reader> Archive<R> {
         )?;
         let base_offset = absolute_cd_offset
             .checked_sub(central_directory_offset)
-            .ok_or(Error::Format(FormatError::InvalidOffset))?;
+            .ok_or(Error::InvalidOffset)?;
         let absolute_cd_end = absolute_cd_offset
             .checked_add(central_directory_size)
-            .ok_or(Error::Format(FormatError::Bounds))?;
+            .ok_or(Error::Bounds)?;
         if absolute_cd_end > eocd_offset || eocd_offset + EOCD_LEN as u64 > size {
-            return Err(Error::Format(FormatError::Bounds));
+            return Err(Error::Bounds);
         }
-        if entry_count == 0 && central_directory_size == 0 && central_directory_offset == 0 && eocd_offset != 0
+        if entry_count == 0
+            && central_directory_size == 0
+            && central_directory_offset == 0
+            && eocd_offset != 0
         {
-            return Err(Error::Format(FormatError::InvalidOffset));
+            return Err(Error::InvalidOffset);
         }
 
         Ok(Self {
@@ -342,13 +331,13 @@ impl<R: Reader> Archive<R> {
     fn absolute_local_offset(&self, local_offset: u64) -> Result<u64, Error<R::Error>> {
         self.base_offset
             .checked_add(local_offset)
-            .ok_or(Error::Format(FormatError::Bounds))
+            .ok_or(Error::Bounds)
     }
 
     fn read_exact_at(&self, pos: u64, buf: &mut [u8]) -> Result<(), Error<R::Error>> {
-        let len = u64::try_from(buf.len()).map_err(|_| Error::Format(FormatError::Bounds))?;
-        if pos.checked_add(len).ok_or(Error::Format(FormatError::Bounds))? > self.size {
-            return Err(Error::Format(FormatError::Truncated));
+        let len = u64::try_from(buf.len()).map_err(|_| Error::Bounds)?;
+        if pos.checked_add(len).ok_or(Error::Bounds)? > self.size {
+            return Err(Error::Truncated);
         }
         self.reader.read_exact_at(pos, buf).map_err(Error::Io)
     }
@@ -410,26 +399,22 @@ impl<'a, R: Reader> Entry<'a, R> {
         let mut header = [0u8; CENTRAL_HEADER_LEN];
         archive.read_exact_at(header_offset, &mut header)?;
         if le_u32(&header[0..4]) != CENTRAL_HEADER_SIGNATURE {
-            return Err(Error::Format(FormatError::InvalidSignature));
+            return Err(Error::InvalidSignature);
         }
 
         let flags = le_u16(&header[8..10]);
         if flags & (1 << 6) != 0 || flags & (1 << 13) != 0 {
-            return Err(Error::Format(FormatError::Unsupported(
-                Unsupported::StrongEncryption,
-            )));
+            return Err(Error::StrongEncryption);
         }
 
         let name_len = u64::from(le_u16(&header[28..30]));
         let extra_len = u64::from(le_u16(&header[30..32]));
         let comment_len = u64::from(le_u16(&header[32..34]));
         let record_len =
-            central_record_len(name_len, extra_len, comment_len).ok_or(Error::Format(FormatError::Bounds))?;
-        let next_offset = header_offset
-            .checked_add(record_len)
-            .ok_or(Error::Format(FormatError::Bounds))?;
+            central_record_len(name_len, extra_len, comment_len).ok_or(Error::Bounds)?;
+        let next_offset = header_offset.checked_add(record_len).ok_or(Error::Bounds)?;
         if next_offset > end_offset {
-            return Err(Error::Format(FormatError::Truncated));
+            return Err(Error::Truncated);
         }
 
         let name_range = (header_offset + CENTRAL_HEADER_LEN as u64)
@@ -449,10 +434,9 @@ impl<'a, R: Reader> Entry<'a, R> {
             || raw_local_offset == u32::MAX;
         if zip64_needed {
             let mut scratch = [0u8; 256];
-            let extra_len_usize =
-                usize::try_from(extra_len).map_err(|_| Error::Format(FormatError::Bounds))?;
+            let extra_len_usize = usize::try_from(extra_len).map_err(|_| Error::Bounds)?;
             if extra_len_usize > scratch.len() {
-                return Err(Error::Format(FormatError::InvalidRecord));
+                return Err(Error::InvalidRecord);
             }
             archive.read_exact_at(extra_range.start, &mut scratch[..extra_len_usize])?;
             let zip64 = find_zip64_extra(
@@ -461,7 +445,7 @@ impl<'a, R: Reader> Entry<'a, R> {
                 raw_compressed_size == u32::MAX,
                 raw_local_offset == u32::MAX,
             )
-            .map_err(Error::Format)?;
+            .map_err(Error::from)?;
             if let Some(size) = zip64.uncompressed_size {
                 uncompressed_size = size;
             }
@@ -473,11 +457,15 @@ impl<'a, R: Reader> Entry<'a, R> {
             }
         }
 
+        let compression_method = le_u16(&header[10..12]);
+        let compression = Compression::from_raw(compression_method)
+            .ok_or(Error::UnsupportedCompression(compression_method))?;
+
         let entry = Self {
             archive,
             name_range,
             flags,
-            compression: Compression::from_raw(le_u16(&header[10..12])),
+            compression,
             crc32: le_u32(&header[16..20]),
             compressed_size,
             uncompressed_size,
@@ -529,7 +517,7 @@ impl<'a, R: Reader> Entry<'a, R> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Format`] if `buf` is too small or the entry range is
+    /// Returns [`Error::Bounds`] if `buf` is too small or the entry range is
     /// inconsistent, and [`Error::Io`] if the underlying read fails.
     pub fn read_path<'b>(&self, buf: &'b mut [u8]) -> Result<&'b [u8], Error<R::Error>> {
         read_variable_range(self.archive, self.name_range.clone(), buf)
@@ -554,17 +542,16 @@ impl<'a, R: Reader> Entry<'a, R> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Format`] if the stored path range is inconsistent, and
-    /// [`Error::Io`] if the underlying reads fail.
+    /// Returns a structural [`Error`] if the stored path range is inconsistent,
+    /// and [`Error::Io`] if the underlying reads fail.
     pub fn filename_is(&self, file_name: &[u8]) -> Result<bool, Error<R::Error>> {
         let component_start = find_path_file_name_start(self.archive, self.name_range.clone())?;
         let component_len = self
             .name_range
             .end
             .checked_sub(component_start)
-            .ok_or(Error::Format(FormatError::Bounds))?;
-        let file_name_len =
-            u64::try_from(file_name.len()).map_err(|_| Error::Format(FormatError::Bounds))?;
+            .ok_or(Error::Bounds)?;
+        let file_name_len = u64::try_from(file_name.len()).map_err(|_| Error::Bounds)?;
         if component_len != file_name_len {
             return Ok(false);
         }
@@ -574,7 +561,7 @@ impl<'a, R: Reader> Entry<'a, R> {
         while compared < file_name.len() {
             let chunk_len = (file_name.len() - compared).min(scratch.len());
             let chunk_offset =
-                component_start + u64::try_from(compared).map_err(|_| Error::Format(FormatError::Bounds))?;
+                component_start + u64::try_from(compared).map_err(|_| Error::Bounds)?;
             self.archive
                 .read_exact_at(chunk_offset, &mut scratch[..chunk_len])?;
             if scratch[..chunk_len] != file_name[compared..compared + chunk_len] {
@@ -593,31 +580,28 @@ impl<'a, R: Reader> Entry<'a, R> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Format`] if the local header is malformed or uses an
+    /// Returns a structural [`Error`] if the local header is malformed or uses an
     /// unsupported feature, and [`Error::Io`] if the underlying read fails.
     pub fn data_range(&self) -> Result<DataRange, Error<R::Error>> {
         if self.flags & 1 != 0 {
-            return Err(Error::Format(FormatError::Unsupported(
-                Unsupported::StrongEncryption,
-            )));
+            return Err(Error::StrongEncryption);
         }
 
-        let local_header_offset = self.archive.absolute_local_offset(self.local_header_offset)?;
+        let local_header_offset = self
+            .archive
+            .absolute_local_offset(self.local_header_offset)?;
         let mut header = [0u8; LOCAL_HEADER_LEN];
-        self.archive.read_exact_at(local_header_offset, &mut header)?;
+        self.archive
+            .read_exact_at(local_header_offset, &mut header)?;
         if le_u32(&header[0..4]) != LOCAL_HEADER_SIGNATURE {
-            return Err(Error::Format(FormatError::InvalidSignature));
+            return Err(Error::InvalidSignature);
         }
         let local_flags = le_u16(&header[6..8]);
         if local_flags & 1 != 0 {
-            return Err(Error::Format(FormatError::Unsupported(
-                Unsupported::StrongEncryption,
-            )));
+            return Err(Error::StrongEncryption);
         }
         if local_flags & (1 << 13) != 0 {
-            return Err(Error::Format(FormatError::Unsupported(
-                Unsupported::MaskedLocalHeaders,
-            )));
+            return Err(Error::MaskedLocalHeaders);
         }
 
         let local_name_len = u64::from(le_u16(&header[26..28]));
@@ -628,9 +612,9 @@ impl<'a, R: Reader> Entry<'a, R> {
         let data_start = local_extra_range.end;
         let data_end = data_start
             .checked_add(self.compressed_size)
-            .ok_or(Error::Format(FormatError::Bounds))?;
+            .ok_or(Error::Bounds)?;
         if data_end > self.archive.size() {
-            return Err(Error::Format(FormatError::Truncated));
+            return Err(Error::Truncated);
         }
 
         Ok(DataRange {
@@ -651,9 +635,9 @@ fn read_variable_range<'a, R: Reader>(
     range: Range<u64>,
     buf: &'a mut [u8],
 ) -> Result<&'a [u8], Error<R::Error>> {
-    let len = range_len_usize(&range).map_err(Error::Format)?;
+    let len = range_len_usize(&range).map_err(Error::from)?;
     if buf.len() < len {
-        return Err(Error::Format(FormatError::Bounds));
+        return Err(Error::Bounds);
     }
     archive.read_exact_at(range.start, &mut buf[..len])?;
     Ok(&buf[..len])
@@ -667,12 +651,9 @@ fn find_path_file_name_start<R: Reader>(
     let mut scratch = [0u8; PATH_SCAN_CHUNK_LEN];
 
     while cursor > path_range.start {
-        let remaining = cursor
-            .checked_sub(path_range.start)
-            .ok_or(Error::Format(FormatError::Bounds))?;
+        let remaining = cursor.checked_sub(path_range.start).ok_or(Error::Bounds)?;
         let chunk_len_u64 = remaining.min(PATH_SCAN_CHUNK_LEN as u64);
-        let chunk_len =
-            usize::try_from(chunk_len_u64).map_err(|_| Error::Format(FormatError::Bounds))?;
+        let chunk_len = usize::try_from(chunk_len_u64).map_err(|_| Error::Bounds)?;
         let chunk_start = cursor - chunk_len_u64;
         archive.read_exact_at(chunk_start, &mut scratch[..chunk_len])?;
 
@@ -723,11 +704,11 @@ struct Zip64Extra {
 #[allow(clippy::large_stack_arrays)]
 fn find_eocd<R: Reader>(reader: &R, size: u64) -> Result<(u64, Eocd), Error<R::Error>> {
     if size < EOCD_LEN as u64 {
-        return Err(Error::Format(FormatError::NotZip));
+        return Err(Error::NotZip);
     }
 
     let window_u64 = size.min(MAX_EOCD_SCAN as u64);
-    let window = usize::try_from(window_u64).map_err(|_| Error::Format(FormatError::Bounds))?;
+    let window = usize::try_from(window_u64).map_err(|_| Error::Bounds)?;
     let start = size - window_u64;
     let mut buffer = [0u8; MAX_EOCD_SCAN];
     let buf = &mut buffer[..window];
@@ -752,7 +733,7 @@ fn find_eocd<R: Reader>(reader: &R, size: u64) -> Result<(u64, Eocd), Error<R::E
         return Ok((start + idx as u64, eocd));
     }
 
-    Err(Error::Format(FormatError::NotZip))
+    Err(Error::NotZip)
 }
 
 fn parse_zip64_metadata<R: Reader>(
@@ -762,46 +743,42 @@ fn parse_zip64_metadata<R: Reader>(
 ) -> Result<Zip64Record, Error<R::Error>> {
     let locator_offset = eocd_offset
         .checked_sub(ZIP64_LOCATOR_LEN as u64)
-        .ok_or(Error::Format(FormatError::InvalidRecord))?;
+        .ok_or(Error::InvalidRecord)?;
     let mut locator = [0u8; ZIP64_LOCATOR_LEN];
-    reader.read_exact_at(locator_offset, &mut locator).map_err(Error::Io)?;
+    reader
+        .read_exact_at(locator_offset, &mut locator)
+        .map_err(Error::Io)?;
     if le_u32(&locator[0..4]) != ZIP64_LOCATOR_SIGNATURE {
-        return Err(Error::Format(FormatError::InvalidSignature));
+        return Err(Error::InvalidSignature);
     }
 
     let disk_number = le_u32(&locator[4..8]);
     let zip64_offset = le_u64(&locator[8..16]);
     let total_disks = le_u32(&locator[16..20]);
     if disk_number != 0 || total_disks != 1 {
-        return Err(Error::Format(FormatError::Unsupported(
-            Unsupported::MultiDisk,
-        )));
+        return Err(Error::MultiDisk);
     }
 
     let zip64_offset = resolve_zip64_record_offset(reader, size, locator_offset, zip64_offset)?;
     let mut header = [0u8; 56];
     if zip64_offset
         .checked_add(header.len() as u64)
-        .ok_or(Error::Format(FormatError::Bounds))?
+        .ok_or(Error::Bounds)?
         > size
     {
-        return Err(Error::Format(FormatError::Truncated));
+        return Err(Error::Truncated);
     }
-    reader.read_exact_at(zip64_offset, &mut header).map_err(Error::Io)?;
+    reader
+        .read_exact_at(zip64_offset, &mut header)
+        .map_err(Error::Io)?;
     if le_u32(&header[0..4]) != ZIP64_EOCD_SIGNATURE {
-        return Err(Error::Format(FormatError::InvalidSignature));
+        return Err(Error::InvalidSignature);
     }
 
     let record_size = le_u64(&header[4..12]);
-    let total_len = record_size
-        .checked_add(12)
-        .ok_or(Error::Format(FormatError::Bounds))?;
-    if zip64_offset
-        .checked_add(total_len)
-        .ok_or(Error::Format(FormatError::Bounds))?
-        > size
-    {
-        return Err(Error::Format(FormatError::Truncated));
+    let total_len = record_size.checked_add(12).ok_or(Error::Bounds)?;
+    if zip64_offset.checked_add(total_len).ok_or(Error::Bounds)? > size {
+        return Err(Error::Truncated);
     }
 
     Ok(Zip64Record {
@@ -827,17 +804,15 @@ fn resolve_zip64_record_offset<R: Reader>(
     }
 
     let start = locator_offset.saturating_sub(SEARCH_WINDOW as u64);
-    let window = locator_offset
-        .checked_sub(start)
-        .ok_or(Error::Format(FormatError::Bounds))?;
-    let window_usize = usize::try_from(window).map_err(|_| Error::Format(FormatError::Bounds))?;
+    let window = locator_offset.checked_sub(start).ok_or(Error::Bounds)?;
+    let window_usize = usize::try_from(window).map_err(|_| Error::Bounds)?;
     let mut buffer = [0u8; SEARCH_WINDOW];
     reader
         .read_exact_at(start, &mut buffer[..window_usize])
         .map_err(Error::Io)?;
 
     if window_usize < 4 {
-        return Err(Error::Format(FormatError::InvalidSignature));
+        return Err(Error::InvalidSignature);
     }
     for idx in (0..=window_usize - 4).rev() {
         if le_u32(&buffer[idx..idx + 4]) == ZIP64_EOCD_SIGNATURE {
@@ -845,7 +820,7 @@ fn resolve_zip64_record_offset<R: Reader>(
         }
     }
 
-    Err(Error::Format(FormatError::InvalidSignature))
+    Err(Error::InvalidSignature)
 }
 
 fn resolve_central_directory_offset<R: Reader>(
@@ -857,7 +832,7 @@ fn resolve_central_directory_offset<R: Reader>(
     let raw_offset = central_directory_offset;
     let inferred_offset = inferred_base_offset
         .checked_add(central_directory_offset)
-        .ok_or(Error::Format(FormatError::Bounds))?;
+        .ok_or(Error::Bounds)?;
 
     let raw_valid = looks_like_central_header(reader, size, raw_offset)?;
     let inferred_valid = looks_like_central_header(reader, size, inferred_offset)?;
@@ -871,7 +846,7 @@ fn resolve_central_directory_offset<R: Reader>(
     if inferred_offset <= size {
         return Ok(inferred_offset);
     }
-    Err(Error::Format(FormatError::InvalidOffset))
+    Err(Error::InvalidOffset)
 }
 
 fn looks_like_central_header<R: Reader>(
@@ -896,7 +871,9 @@ fn looks_like_signature<R: Reader>(
     }
 
     let mut bytes = [0u8; 4];
-    reader.read_exact_at(offset, &mut bytes).map_err(Error::Io)?;
+    reader
+        .read_exact_at(offset, &mut bytes)
+        .map_err(Error::Io)?;
     Ok(le_u32(&bytes) == signature)
 }
 
@@ -905,14 +882,14 @@ fn find_zip64_extra(
     need_uncompressed: bool,
     need_compressed: bool,
     need_offset: bool,
-) -> Result<Zip64Extra, FormatError> {
+) -> Result<Zip64Extra, StructuralError> {
     let mut out = Zip64Extra::default();
     while extra.len() >= 4 {
         let kind = le_u16(&extra[0..2]);
         let len = usize::from(le_u16(&extra[2..4]));
         extra = &extra[4..];
         if len > extra.len() {
-            return Err(FormatError::InvalidRecord);
+            return Err(StructuralError::InvalidRecord);
         }
         let field = &extra[..len];
         extra = &extra[len..];
@@ -933,13 +910,13 @@ fn find_zip64_extra(
         }
         return Ok(out);
     }
-    Err(FormatError::InvalidRecord)
+    Err(StructuralError::InvalidRecord)
 }
 
-fn read_extra_u64(extra: &[u8], pos: &mut usize) -> Result<u64, FormatError> {
-    let end = pos.checked_add(8).ok_or(FormatError::Bounds)?;
+fn read_extra_u64(extra: &[u8], pos: &mut usize) -> Result<u64, StructuralError> {
+    let end = pos.checked_add(8).ok_or(StructuralError::Bounds)?;
     if end > extra.len() {
-        return Err(FormatError::InvalidRecord);
+        return Err(StructuralError::InvalidRecord);
     }
     let value = le_u64(&extra[*pos..end]);
     *pos = end;
@@ -948,9 +925,7 @@ fn read_extra_u64(extra: &[u8], pos: &mut usize) -> Result<u64, FormatError> {
 
 fn ensure_single_disk<E>(disk_number: u32, central_directory_disk: u32) -> Result<(), Error<E>> {
     if disk_number != 0 || central_directory_disk != 0 {
-        return Err(Error::Format(FormatError::Unsupported(
-            Unsupported::MultiDisk,
-        )));
+        return Err(Error::MultiDisk);
     }
     Ok(())
 }
@@ -962,9 +937,12 @@ fn central_record_len(name_len: u64, extra_len: u64, comment_len: u64) -> Option
         .and_then(|v| v.checked_add(comment_len))
 }
 
-fn range_len_usize(range: &Range<u64>) -> Result<usize, FormatError> {
-    let len = range.end.checked_sub(range.start).ok_or(FormatError::Bounds)?;
-    usize::try_from(len).map_err(|_| FormatError::Bounds)
+fn range_len_usize(range: &Range<u64>) -> Result<usize, StructuralError> {
+    let len = range
+        .end
+        .checked_sub(range.start)
+        .ok_or(StructuralError::Bounds)?;
+    usize::try_from(len).map_err(|_| StructuralError::Bounds)
 }
 
 fn le_u16(bytes: &[u8]) -> u16 {
@@ -979,34 +957,4 @@ fn le_u64(bytes: &[u8]) -> u64 {
     u64::from_le_bytes([
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ])
-}
-
-#[cfg(test)]
-mod tests {
-    use super::path_file_name_eq;
-
-    #[test]
-    fn path_file_name_eq_matches_bare_file_name() {
-        assert!(path_file_name_eq(b"file.txt", b"file.txt"));
-        assert!(!path_file_name_eq(b"file.txt", b"other.txt"));
-    }
-
-    #[test]
-    fn path_file_name_eq_matches_last_component_only() {
-        assert!(path_file_name_eq(b"dir/subdir/file.txt", b"file.txt"));
-        assert!(!path_file_name_eq(b"dir/subdir/file.txt", b"subdir"));
-    }
-
-    #[test]
-    fn path_file_name_eq_treats_trailing_slash_as_empty_component() {
-        assert!(path_file_name_eq(b"dir/", b""));
-        assert!(path_file_name_eq(b"/", b""));
-        assert!(!path_file_name_eq(b"dir/", b"dir"));
-    }
-
-    #[test]
-    fn path_file_name_eq_preserves_raw_bytes() {
-        assert!(path_file_name_eq(b"dir/\xFF.bin", b"\xFF.bin"));
-        assert!(!path_file_name_eq(b"dir\\file.txt", b"file.txt"));
-    }
 }

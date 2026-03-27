@@ -1,0 +1,13 @@
+[package]
+name = "tinyzip"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+std = []
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]

@@ -51,9 +51,7 @@ struct Fixture {
 enum Expected {
     Reject(FormatError),
     Accept {
-        base_offset: u64,
         entry_count: u64,
-        zip64: bool,
         entries: &'static [ExpectedEntry],
     },
 }
@@ -114,9 +112,7 @@ const MANUAL_FIXTURES: &[Fixture] = &[
         name: "test.zip",
         path: "tests/data/manual/go-archive-zip/test.zip",
         expected: Expected::Accept {
-            base_offset: 0,
             entry_count: 2,
-            zip64: false,
             entries: TEST_ENTRIES,
         },
     },
@@ -124,9 +120,7 @@ const MANUAL_FIXTURES: &[Fixture] = &[
         name: "test-trailing-junk.zip",
         path: "tests/data/manual/go-archive-zip/test-trailing-junk.zip",
         expected: Expected::Accept {
-            base_offset: 0,
             entry_count: 2,
-            zip64: false,
             entries: TEST_ENTRIES,
         },
     },
@@ -134,9 +128,7 @@ const MANUAL_FIXTURES: &[Fixture] = &[
         name: "test-prefix.zip",
         path: "tests/data/manual/go-archive-zip/test-prefix.zip",
         expected: Expected::Accept {
-            base_offset: 43,
             entry_count: 2,
-            zip64: false,
             entries: TEST_ENTRIES,
         },
     },
@@ -144,9 +136,7 @@ const MANUAL_FIXTURES: &[Fixture] = &[
         name: "dd.zip",
         path: "tests/data/manual/go-archive-zip/dd.zip",
         expected: Expected::Accept {
-            base_offset: 0,
             entry_count: 1,
-            zip64: false,
             entries: DD_ENTRIES,
         },
     },
@@ -154,9 +144,7 @@ const MANUAL_FIXTURES: &[Fixture] = &[
         name: "go-with-datadesc-sig.zip",
         path: "tests/data/manual/go-archive-zip/go-with-datadesc-sig.zip",
         expected: Expected::Accept {
-            base_offset: 0,
             entry_count: 2,
-            zip64: false,
             entries: GO_STORED_ENTRIES,
         },
     },
@@ -164,9 +152,7 @@ const MANUAL_FIXTURES: &[Fixture] = &[
         name: "zip64.zip",
         path: "tests/data/manual/go-archive-zip/zip64.zip",
         expected: Expected::Accept {
-            base_offset: 0,
             entry_count: 1,
-            zip64: true,
             entries: ZIP64_ENTRIES,
         },
     },
@@ -174,9 +160,7 @@ const MANUAL_FIXTURES: &[Fixture] = &[
         name: "zip64-2.zip",
         path: "tests/data/manual/go-archive-zip/zip64-2.zip",
         expected: Expected::Accept {
-            base_offset: 0,
             entry_count: 1,
-            zip64: true,
             entries: ZIP64_ENTRIES,
         },
     },
@@ -189,9 +173,7 @@ const MANUAL_FIXTURES: &[Fixture] = &[
         name: "test-baddirsz.zip",
         path: "tests/data/manual/go-archive-zip/test-baddirsz.zip",
         expected: Expected::Accept {
-            base_offset: 0,
             entry_count: 2,
-            zip64: false,
             entries: TEST_ENTRIES,
         },
     },
@@ -199,9 +181,7 @@ const MANUAL_FIXTURES: &[Fixture] = &[
         name: "test-badbase.zip",
         path: "tests/data/manual/go-archive-zip/test-badbase.zip",
         expected: Expected::Accept {
-            base_offset: 0,
             entry_count: 2,
-            zip64: false,
             entries: TEST_ENTRIES,
         },
     },
@@ -222,15 +202,10 @@ fn manual_inspected_corpus() {
                     err
                 );
             }
-            Expected::Accept {
-                base_offset,
-                entry_count,
-                zip64,
-                entries,
-            } => {
+            Expected::Accept { entry_count, entries } => {
                 let bytes = read_fixture(fixture.path);
                 let archive = open_archive(&bytes, fixture.path);
-                assert_archive_meta(fixture.name, &archive, *base_offset, *entry_count, *zip64);
+                assert_archive_meta(fixture.name, &archive, *entry_count);
 
                 let mut iter = archive.entries();
                 for (entry_index, expected) in entries.iter().enumerate() {
@@ -332,7 +307,6 @@ fn synthetic_empty_zip() {
     let bytes = empty_zip();
     let archive = Archive::open(bytes.as_slice()).unwrap();
     assert_eq!(archive.entry_count(), 0);
-    assert_eq!(archive.base_offset(), 0);
     assert_eq!(archive.entries().count(), 0);
 }
 
@@ -419,7 +393,7 @@ fn fail_reason(bytes: &[u8], path: &str) -> Option<String> {
             None => return Some(format!("iterator ended early after {entry_index} entries")),
         };
 
-        if let Err(err) = entry.read_path(&mut vec![0u8; range_len_usize(&entry.name_range())]) {
+        if let Err(err) = entry.read_path(&mut vec![0u8; PATH_BUF_LEN]) {
             return Some(format!("entry {entry_index} name read failed: {err:?}"));
         }
         if let Err(err) = entry.data_range() {
@@ -458,11 +432,9 @@ fn open_fixture_expect_err(path: &str) -> Error<SliceReaderError> {
     let bytes = read_fixture(path);
     match Archive::open(bytes.as_slice()) {
         Ok(archive) => panic!(
-            "fixture {}: expected open error, got archive with base_offset={}, entry_count={}, zip64={}",
+            "fixture {}: expected open error, got archive with entry_count={}",
             path,
-            archive.base_offset(),
-            archive.entry_count(),
-            archive.is_zip64()
+            archive.entry_count()
         ),
         Err(err) => err,
     }
@@ -476,18 +448,8 @@ fn open_archive<'a>(bytes: &'a [u8], label: &str) -> Archive<&'a [u8]> {
 fn assert_archive_meta(
     label: &str,
     archive: &Archive<&[u8]>,
-    expected_base_offset: u64,
     expected_entry_count: u64,
-    expected_zip64: bool,
 ) {
-    assert_eq!(
-        archive.base_offset(),
-        expected_base_offset,
-        "fixture {}: base_offset mismatch, expected {}, got {}",
-        label,
-        expected_base_offset,
-        archive.base_offset()
-    );
     assert_eq!(
         archive.entry_count(),
         expected_entry_count,
@@ -495,14 +457,6 @@ fn assert_archive_meta(
         label,
         expected_entry_count,
         archive.entry_count()
-    );
-    assert_eq!(
-        archive.is_zip64(),
-        expected_zip64,
-        "fixture {}: zip64 flag mismatch, expected {}, got {}",
-        label,
-        expected_zip64,
-        archive.is_zip64()
     );
 }
 
@@ -569,15 +523,7 @@ fn assert_entry_matches(
         expected.uncompressed_size,
         entry.uncompressed_size()
     );
-    assert!(
-        entry.central_header_range().end <= archive.size(),
-        "fixture {} entry {} (name {}): central header range {:?} exceeds archive size {}",
-        label,
-        entry_index,
-        format_name(&name),
-        entry.central_header_range(),
-        archive.size()
-    );
+    let _ = archive;
 }
 
 fn assert_coherent_data_range(
@@ -655,15 +601,11 @@ fn entry_name(
     entry_index: u64,
     entry: &tinyzip::Entry<'_, &[u8]>,
 ) -> Vec<u8> {
-    let mut name_buf = vec![0u8; range_len_usize(&entry.name_range())];
+    let mut name_buf = vec![0u8; PATH_BUF_LEN];
     match entry.read_path(&mut name_buf) {
         Ok(name) => name.to_vec(),
         Err(err) => panic!(
-            "fixture {} entry {}: failed to read name from range {:?}: {:?}",
-            label,
-            entry_index,
-            entry.name_range(),
-            err
+            "fixture {label} entry {entry_index}: failed to read path bytes: {err:?}"
         ),
     }
 }
@@ -676,12 +618,10 @@ fn entry_data_range(
     match entry.data_range() {
         Ok(data) => data,
         Err(err) => panic!(
-            "fixture {} entry {}: failed to resolve data range for name {} local_header_offset={} name_range={:?} compression={:?} compressed_size={} uncompressed_size={}: {:?}",
+            "fixture {} entry {}: failed to resolve data range for name {} compression={:?} compressed_size={} uncompressed_size={}: {:?}",
             label,
             entry_index,
             format_name(&entry_name(label, entry_index, entry)),
-            entry.local_header_offset(),
-            entry.name_range(),
             entry.compression(),
             entry.compressed_size(),
             entry.uncompressed_size(),
@@ -772,10 +712,6 @@ fn range_len(range: &std::ops::Range<u64>) -> u64 {
     range.end - range.start
 }
 
-fn range_len_usize(range: &std::ops::Range<u64>) -> usize {
-    usize::try_from(range_len(range)).expect("range length does not fit usize")
-}
-
 fn to_u16(value: usize) -> u16 {
     u16::try_from(value).expect("value does not fit u16")
 }
@@ -783,3 +719,5 @@ fn to_u16(value: usize) -> u16 {
 fn to_u32(value: usize) -> u32 {
     u32::try_from(value).expect("value does not fit u32")
 }
+
+const PATH_BUF_LEN: usize = u16::MAX as usize;

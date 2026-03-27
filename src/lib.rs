@@ -235,12 +235,9 @@ pub struct Archive<R> {
     reader: R,
     size: u64,
     base_offset: u64,
-    eocd_offset: u64,
     directory_end_offset: u64,
     central_directory_offset: u64,
-    central_directory_size: u64,
     entry_count: u64,
-    zip64: bool,
 }
 
 impl<R: Reader> Archive<R> {
@@ -260,7 +257,7 @@ impl<R: Reader> Archive<R> {
 
         ensure_single_disk(u32::from(eocd.disk_number), u32::from(eocd.central_directory_disk))?;
 
-        let (entry_count, central_directory_size, central_directory_offset, zip64, payload_end) =
+        let (entry_count, central_directory_size, central_directory_offset, payload_end) =
             if eocd.needs_zip64() {
                 let zip64 = parse_zip64_metadata(&reader, size, eocd_offset)?;
                 ensure_single_disk(zip64.disk_number, zip64.central_directory_disk)?;
@@ -268,7 +265,6 @@ impl<R: Reader> Archive<R> {
                     zip64.entry_count,
                     zip64.central_directory_size,
                     zip64.central_directory_offset,
-                    true,
                     zip64.record_offset,
                 )
             } else {
@@ -276,7 +272,6 @@ impl<R: Reader> Archive<R> {
                     u64::from(eocd.entry_count),
                     u64::from(eocd.central_directory_size),
                     u64::from(eocd.central_directory_offset),
-                    false,
                     eocd_offset,
                 )
             };
@@ -311,12 +306,9 @@ impl<R: Reader> Archive<R> {
             reader,
             size,
             base_offset,
-            eocd_offset,
             directory_end_offset: payload_end,
             central_directory_offset,
-            central_directory_size,
             entry_count,
-            zip64,
         })
     }
 
@@ -325,37 +317,10 @@ impl<R: Reader> Archive<R> {
         self.size
     }
 
-    /// Returns the number of bytes before the ZIP payload.
-    ///
-    /// This is `0` for ordinary archives and non-zero for self-extracting or
-    /// otherwise prefixed archives.
-    pub fn base_offset(&self) -> u64 {
-        self.base_offset
-    }
-
-    /// Returns the absolute offset of the EOCD record.
-    pub fn eocd_offset(&self) -> u64 {
-        self.eocd_offset
-    }
-
-    /// Returns the central-directory byte range as stored in archive-relative
-    /// coordinates.
-    ///
-    /// Add [`Self::base_offset`] to convert the start to an absolute archive
-    /// position when the archive has a prefix.
-    pub fn central_directory_range(&self) -> Range<u64> {
-        self.central_directory_offset..self.central_directory_offset + self.central_directory_size
-    }
-
     /// Returns the number of entries reported by the authoritative central
     /// directory.
     pub fn entry_count(&self) -> u64 {
         self.entry_count
-    }
-
-    /// Returns whether archive-level ZIP64 records were required.
-    pub fn is_zip64(&self) -> bool {
-        self.zip64
     }
 
     /// Returns a forward-only iterator over central-directory entries.
@@ -427,11 +392,7 @@ impl<'a, R: Reader> Iterator for Entries<'a, R> {
 /// caller-provided buffers with the `read_*` methods.
 pub struct Entry<'a, R> {
     archive: &'a Archive<R>,
-    header_offset: u64,
-    header_range: Range<u64>,
     name_range: Range<u64>,
-    extra_range: Range<u64>,
-    comment_range: Range<u64>,
     flags: u16,
     compression: Compression,
     crc32: u32,
@@ -472,11 +433,9 @@ impl<'a, R: Reader> Entry<'a, R> {
             return Err(Error::Format(FormatError::Truncated));
         }
 
-        let header_range = header_offset..next_offset;
         let name_range = (header_offset + CENTRAL_HEADER_LEN as u64)
             ..(header_offset + CENTRAL_HEADER_LEN as u64 + name_len);
         let extra_range = name_range.end..name_range.end + extra_len;
-        let comment_range = extra_range.end..extra_range.end + comment_len;
 
         let raw_compressed_size = le_u32(&header[20..24]);
         let raw_uncompressed_size = le_u32(&header[24..28]);
@@ -517,11 +476,7 @@ impl<'a, R: Reader> Entry<'a, R> {
 
         let entry = Self {
             archive,
-            header_offset,
-            header_range,
             name_range,
-            extra_range,
-            comment_range,
             flags,
             compression: Compression::from_raw(le_u16(&header[10..12])),
             crc32: le_u32(&header[16..20]),
@@ -563,47 +518,6 @@ impl<'a, R: Reader> Entry<'a, R> {
         self.uncompressed_size
     }
 
-    /// Returns the absolute archive offset of this central-directory header.
-    #[must_use]
-    pub fn central_header_offset(&self) -> u64 {
-        self.header_offset
-    }
-
-    /// Returns the absolute archive byte range occupied by this central
-    /// directory record, including name, extra, and comment.
-    #[must_use]
-    pub fn central_header_range(&self) -> Range<u64> {
-        self.header_range.clone()
-    }
-
-    /// Returns the absolute archive byte range of the entry name inside the
-    /// central directory.
-    #[must_use]
-    pub fn name_range(&self) -> Range<u64> {
-        self.name_range.clone()
-    }
-
-    /// Returns the absolute archive byte range of the central-directory extra
-    /// field.
-    #[must_use]
-    pub fn extra_range(&self) -> Range<u64> {
-        self.extra_range.clone()
-    }
-
-    /// Returns the absolute archive byte range of the central-directory comment.
-    #[must_use]
-    pub fn comment_range(&self) -> Range<u64> {
-        self.comment_range.clone()
-    }
-
-    /// Returns the absolute archive offset of the entry's local header.
-    ///
-    /// This offset already includes any archive prefix.
-    #[must_use]
-    pub fn local_header_offset(&self) -> u64 {
-        self.archive.base_offset + self.local_header_offset
-    }
-
     /// Reads the central-directory path bytes into `buf`.
     ///
     /// ZIP stores a single byte string here rather than a structured path. It
@@ -619,31 +533,7 @@ impl<'a, R: Reader> Entry<'a, R> {
     /// Returns [`Error::Format`] if `buf` is too small or the entry range is
     /// inconsistent, and [`Error::Io`] if the underlying read fails.
     pub fn read_path<'b>(&self, buf: &'b mut [u8]) -> Result<&'b [u8], Error<R::Error>> {
-        read_variable_range(self.archive, self.name_range(), buf)
-    }
-
-    /// Reads the central-directory extra field into `buf`.
-    ///
-    /// `buf` must be at least [`Self::extra_range`] long.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Format`] if `buf` is too small or the entry range is
-    /// inconsistent, and [`Error::Io`] if the underlying read fails.
-    pub fn read_extra<'b>(&self, buf: &'b mut [u8]) -> Result<&'b [u8], Error<R::Error>> {
-        read_variable_range(self.archive, self.extra_range(), buf)
-    }
-
-    /// Reads the central-directory comment into `buf`.
-    ///
-    /// `buf` must be at least [`Self::comment_range`] long.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Format`] if `buf` is too small or the entry range is
-    /// inconsistent, and [`Error::Io`] if the underlying read fails.
-    pub fn read_comment<'b>(&self, buf: &'b mut [u8]) -> Result<&'b [u8], Error<R::Error>> {
-        read_variable_range(self.archive, self.comment_range(), buf)
+        read_variable_range(self.archive, self.name_range.clone(), buf)
     }
 
     /// Returns whether the final `/`-separated component of the entry path
@@ -658,9 +548,9 @@ impl<'a, R: Reader> Entry<'a, R> {
     /// Returns [`Error::Format`] if the stored path range is inconsistent, and
     /// [`Error::Io`] if the underlying reads fail.
     pub fn filename_is(&self, file_name: &[u8]) -> Result<bool, Error<R::Error>> {
-        let component_start = find_path_file_name_start(self.archive, self.name_range())?;
+        let component_start = find_path_file_name_start(self.archive, self.name_range.clone())?;
         let component_len = self
-            .name_range()
+            .name_range
             .end
             .checked_sub(component_start)
             .ok_or(Error::Format(FormatError::Bounds))?;

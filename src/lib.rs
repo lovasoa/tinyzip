@@ -193,21 +193,6 @@ impl<E: fmt::Display> fmt::Display for Error<E> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StructuralError {
-    InvalidRecord,
-    Bounds,
-}
-
-impl<E> From<StructuralError> for Error<E> {
-    fn from(value: StructuralError) -> Self {
-        match value {
-            StructuralError::InvalidRecord => Self::InvalidRecord,
-            StructuralError::Bounds => Self::InvalidOffset,
-        }
-    }
-}
-
 /// Open ZIP archive backed by a random-access reader.
 ///
 /// The archive stores only fixed-size metadata. Entry records and local headers
@@ -435,8 +420,7 @@ impl<'a, R: Reader> Entry<'a, R> {
                 raw_uncompressed_size == u32::MAX,
                 raw_compressed_size == u32::MAX,
                 raw_local_offset == u32::MAX,
-            )
-            .map_err(Error::from)?;
+            )?;
             if let Some(size) = zip64.uncompressed_size {
                 uncompressed_size = size;
             }
@@ -624,7 +608,7 @@ fn read_variable_range<'a, R: Reader>(
     range: Range<u64>,
     buf: &'a mut [u8],
 ) -> Result<&'a [u8], Error<R::Error>> {
-    let len = range_len_usize(&range).map_err(Error::from)?;
+    let len = range_len_usize(&range)?;
     if buf.len() < len {
         return Err(Error::InvalidOffset);
     }
@@ -864,19 +848,19 @@ fn looks_like_signature<R: Reader>(
     Ok(le_u32(&bytes) == signature)
 }
 
-fn find_zip64_extra(
+fn find_zip64_extra<E>(
     mut extra: &[u8],
     need_uncompressed: bool,
     need_compressed: bool,
     need_offset: bool,
-) -> Result<Zip64Extra, StructuralError> {
+) -> Result<Zip64Extra, Error<E>> {
     let mut out = Zip64Extra::default();
     while extra.len() >= 4 {
         let kind = le_u16(&extra[0..2]);
         let len = usize::from(le_u16(&extra[2..4]));
         extra = &extra[4..];
         if len > extra.len() {
-            return Err(StructuralError::InvalidRecord);
+            return Err(Error::InvalidRecord);
         }
         let field = &extra[..len];
         extra = &extra[len..];
@@ -897,13 +881,13 @@ fn find_zip64_extra(
         }
         return Ok(out);
     }
-    Err(StructuralError::InvalidRecord)
+    Err(Error::InvalidRecord)
 }
 
-fn read_extra_u64(extra: &[u8], pos: &mut usize) -> Result<u64, StructuralError> {
-    let end = pos.checked_add(8).ok_or(StructuralError::Bounds)?;
+fn read_extra_u64<E>(extra: &[u8], pos: &mut usize) -> Result<u64, Error<E>> {
+    let end = pos.checked_add(8).ok_or(Error::InvalidOffset)?;
     if end > extra.len() {
-        return Err(StructuralError::InvalidRecord);
+        return Err(Error::InvalidRecord);
     }
     let value = le_u64(&extra[*pos..end]);
     *pos = end;
@@ -928,12 +912,12 @@ fn central_record_len(name_len: u64, extra_len: u64, comment_len: u64) -> Option
         .and_then(|v| v.checked_add(comment_len))
 }
 
-fn range_len_usize(range: &Range<u64>) -> Result<usize, StructuralError> {
+fn range_len_usize<E>(range: &Range<u64>) -> Result<usize, Error<E>> {
     let len = range
         .end
         .checked_sub(range.start)
-        .ok_or(StructuralError::Bounds)?;
-    usize::try_from(len).map_err(|_| StructuralError::Bounds)
+        .ok_or(Error::InvalidOffset)?;
+    usize::try_from(len).map_err(|_| Error::InvalidOffset)
 }
 
 fn le_u16(bytes: &[u8]) -> u16 {

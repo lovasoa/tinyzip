@@ -378,6 +378,19 @@ fn synthetic_filename_is_reads_only_needed_suffix_bytes() {
     );
 }
 
+#[test]
+fn synthetic_path_is_utf8_distinguishes_raw_bytes() {
+    let valid = simple_stored_zip(b"dir/hello.txt", b"payload");
+    let valid_archive = Archive::open(valid.as_slice()).unwrap();
+    let valid_entry = valid_archive.entries().next().unwrap().unwrap();
+    assert!(valid_entry.path_is_utf8().unwrap());
+
+    let invalid = simple_stored_zip(b"dir/\xFF.txt", b"payload");
+    let invalid_archive = Archive::open(invalid.as_slice()).unwrap();
+    let invalid_entry = invalid_archive.entries().next().unwrap().unwrap();
+    assert!(!invalid_entry.path_is_utf8().unwrap());
+}
+
 fn fail_reason(bytes: &[u8], path: &str) -> Option<String> {
     let archive = match Archive::open(bytes) {
         Ok(archive) => archive,

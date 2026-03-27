@@ -26,6 +26,7 @@ const ZIP64_LOCATOR_LEN: usize = 20;
 const CENTRAL_HEADER_LEN: usize = 46;
 const LOCAL_HEADER_LEN: usize = 30;
 const MAX_EOCD_SCAN: usize = EOCD_LEN + u16::MAX as usize;
+const PATH_SCAN_CHUNK_LEN: usize = 64;
 
 /// Random-access byte source used by [`Archive`].
 ///
@@ -115,8 +116,6 @@ pub fn path_file_name_eq(path: &[u8], file_name: &[u8]) -> bool {
     };
     component == file_name
 }
-
-const PATH_SCAN_CHUNK_LEN: usize = 64;
 
 /// ZIP compression methods exposed by the central directory.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -522,11 +521,11 @@ impl<'a, R: Reader> Entry<'a, R> {
     ///
     /// ZIP stores a single byte string here rather than a structured path. It
     /// may be just a bare file name, a `/`-separated nested path, or a
-    /// directory marker ending in `/`. The bytes are not guaranteed to be
-    /// UTF-8 unless the archive says so.
+    /// directory marker ending in `/`. Use [`Self::path_is_utf8`] before
+    /// decoding if you need to know whether the raw bytes form valid UTF-8.
     ///
-    /// `buf` must be at least [`Self::name_range`] long. The returned slice
-    /// borrows `buf` and is exactly the bytes read from the archive.
+    /// `buf` must be large enough to hold the full stored path. The returned
+    /// slice borrows `buf` and is exactly the bytes read from the archive.
     ///
     /// # Errors
     ///
@@ -534,6 +533,57 @@ impl<'a, R: Reader> Entry<'a, R> {
     /// inconsistent, and [`Error::Io`] if the underlying read fails.
     pub fn read_path<'b>(&self, buf: &'b mut [u8]) -> Result<&'b [u8], Error<R::Error>> {
         read_variable_range(self.archive, self.name_range.clone(), buf)
+    }
+
+    /// Returns whether the entry path bytes are valid UTF-8.
+    ///
+    /// This reads the stored path in small chunks and validates the byte stream
+    /// incrementally. It does not allocate or normalize the path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Format`] if the stored path range is inconsistent, and
+    /// [`Error::Io`] if the underlying reads fail.
+    pub fn path_is_utf8(&self) -> Result<bool, Error<R::Error>> {
+        let mut scratch = [0u8; PATH_SCAN_CHUNK_LEN + 4];
+        let mut path_offset = self.name_range.start;
+        let mut carry_len = 0usize;
+
+        while path_offset < self.name_range.end {
+            let remaining = self
+                .name_range
+                .end
+                .checked_sub(path_offset)
+                .ok_or(Error::Format(FormatError::Bounds))?;
+            let chunk_len = usize::try_from(remaining.min(PATH_SCAN_CHUNK_LEN as u64))
+                .map_err(|_| Error::Format(FormatError::Bounds))?;
+            self.archive
+                .read_exact_at(path_offset, &mut scratch[carry_len..carry_len + chunk_len])?;
+
+            let total_len = carry_len + chunk_len;
+            match core::str::from_utf8(&scratch[..total_len]) {
+                Ok(_) => {
+                    carry_len = 0;
+                }
+                Err(err) => {
+                    if err.error_len().is_some() {
+                        return Ok(false);
+                    }
+                    let valid_up_to = err.valid_up_to();
+                    let trailing = total_len
+                        .checked_sub(valid_up_to)
+                        .ok_or(Error::Format(FormatError::Bounds))?;
+                    scratch.copy_within(valid_up_to..total_len, 0);
+                    carry_len = trailing;
+                }
+            }
+
+            path_offset = path_offset
+                .checked_add(u64::try_from(chunk_len).map_err(|_| Error::Format(FormatError::Bounds))?)
+                .ok_or(Error::Format(FormatError::Bounds))?;
+        }
+
+        Ok(carry_len == 0)
     }
 
     /// Returns whether the final `/`-separated component of the entry path

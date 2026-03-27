@@ -164,8 +164,6 @@ pub enum Error<E> {
     InvalidOffset,
     /// A record was malformed even though its outer signature matched.
     InvalidRecord,
-    /// Arithmetic overflow or a value that cannot fit the required in-memory type.
-    Bounds,
     /// Split or multi-disk archives.
     MultiDisk,
     /// Strong encryption markers in central or local headers.
@@ -185,7 +183,6 @@ impl<E: fmt::Display> fmt::Display for Error<E> {
             Self::InvalidSignature => f.write_str("invalid ZIP signature"),
             Self::InvalidOffset => f.write_str("invalid ZIP offset"),
             Self::InvalidRecord => f.write_str("invalid ZIP record"),
-            Self::Bounds => f.write_str("ZIP bounds error"),
             Self::MultiDisk => f.write_str("multi-disk ZIP archives are unsupported"),
             Self::StrongEncryption => f.write_str("strong encryption is unsupported"),
             Self::MaskedLocalHeaders => f.write_str("masked local headers are unsupported"),
@@ -206,7 +203,7 @@ impl<E> From<StructuralError> for Error<E> {
     fn from(value: StructuralError) -> Self {
         match value {
             StructuralError::InvalidRecord => Self::InvalidRecord,
-            StructuralError::Bounds => Self::Bounds,
+            StructuralError::Bounds => Self::InvalidOffset,
         }
     }
 }
@@ -263,9 +260,7 @@ impl<R: Reader> Archive<R> {
                 )
             };
 
-        let used = central_directory_offset
-            .checked_add(central_directory_size)
-            .ok_or(Error::Bounds)?;
+        let used = add(central_directory_offset, central_directory_size)?;
         let inferred_base_offset = payload_end.checked_sub(used).ok_or(Error::InvalidOffset)?;
         let absolute_cd_offset = resolve_central_directory_offset(
             &reader,
@@ -276,11 +271,9 @@ impl<R: Reader> Archive<R> {
         let base_offset = absolute_cd_offset
             .checked_sub(central_directory_offset)
             .ok_or(Error::InvalidOffset)?;
-        let absolute_cd_end = absolute_cd_offset
-            .checked_add(central_directory_size)
-            .ok_or(Error::Bounds)?;
+        let absolute_cd_end = add(absolute_cd_offset, central_directory_size)?;
         if absolute_cd_end > eocd_offset || eocd_offset + EOCD_LEN as u64 > size {
-            return Err(Error::Bounds);
+            return Err(Error::InvalidOffset);
         }
         if entry_count == 0
             && central_directory_size == 0
@@ -329,14 +322,12 @@ impl<R: Reader> Archive<R> {
     }
 
     fn absolute_local_offset(&self, local_offset: u64) -> Result<u64, Error<R::Error>> {
-        self.base_offset
-            .checked_add(local_offset)
-            .ok_or(Error::Bounds)
+        add(self.base_offset, local_offset)
     }
 
     fn read_exact_at(&self, pos: u64, buf: &mut [u8]) -> Result<(), Error<R::Error>> {
-        let len = u64::try_from(buf.len()).map_err(|_| Error::Bounds)?;
-        if pos.checked_add(len).ok_or(Error::Bounds)? > self.size {
+        let len = u64::try_from(buf.len()).map_err(|_| Error::InvalidOffset)?;
+        if add(pos, len)? > self.size {
             return Err(Error::Truncated);
         }
         self.reader.read_exact_at(pos, buf).map_err(Error::Io)
@@ -411,8 +402,8 @@ impl<'a, R: Reader> Entry<'a, R> {
         let extra_len = u64::from(le_u16(&header[30..32]));
         let comment_len = u64::from(le_u16(&header[32..34]));
         let record_len =
-            central_record_len(name_len, extra_len, comment_len).ok_or(Error::Bounds)?;
-        let next_offset = header_offset.checked_add(record_len).ok_or(Error::Bounds)?;
+            central_record_len(name_len, extra_len, comment_len).ok_or(Error::InvalidOffset)?;
+        let next_offset = add(header_offset, record_len)?;
         if next_offset > end_offset {
             return Err(Error::Truncated);
         }
@@ -434,7 +425,7 @@ impl<'a, R: Reader> Entry<'a, R> {
             || raw_local_offset == u32::MAX;
         if zip64_needed {
             let mut scratch = [0u8; 256];
-            let extra_len_usize = usize::try_from(extra_len).map_err(|_| Error::Bounds)?;
+            let extra_len_usize = usize::try_from(extra_len).map_err(|_| Error::InvalidOffset)?;
             if extra_len_usize > scratch.len() {
                 return Err(Error::InvalidRecord);
             }
@@ -517,7 +508,7 @@ impl<'a, R: Reader> Entry<'a, R> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Bounds`] if `buf` is too small or the entry range is
+    /// Returns [`Error::InvalidOffset`] if `buf` is too small or the entry range is
     /// inconsistent, and [`Error::Io`] if the underlying read fails.
     pub fn read_path<'b>(&self, buf: &'b mut [u8]) -> Result<&'b [u8], Error<R::Error>> {
         read_variable_range(self.archive, self.name_range.clone(), buf)
@@ -550,8 +541,8 @@ impl<'a, R: Reader> Entry<'a, R> {
             .name_range
             .end
             .checked_sub(component_start)
-            .ok_or(Error::Bounds)?;
-        let file_name_len = u64::try_from(file_name.len()).map_err(|_| Error::Bounds)?;
+            .ok_or(Error::InvalidOffset)?;
+        let file_name_len = u64::try_from(file_name.len()).map_err(|_| Error::InvalidOffset)?;
         if component_len != file_name_len {
             return Ok(false);
         }
@@ -561,7 +552,7 @@ impl<'a, R: Reader> Entry<'a, R> {
         while compared < file_name.len() {
             let chunk_len = (file_name.len() - compared).min(scratch.len());
             let chunk_offset =
-                component_start + u64::try_from(compared).map_err(|_| Error::Bounds)?;
+                component_start + u64::try_from(compared).map_err(|_| Error::InvalidOffset)?;
             self.archive
                 .read_exact_at(chunk_offset, &mut scratch[..chunk_len])?;
             if scratch[..chunk_len] != file_name[compared..compared + chunk_len] {
@@ -610,9 +601,7 @@ impl<'a, R: Reader> Entry<'a, R> {
             ..(local_header_offset + LOCAL_HEADER_LEN as u64 + local_name_len);
         let local_extra_range = local_name_range.end..local_name_range.end + local_extra_len;
         let data_start = local_extra_range.end;
-        let data_end = data_start
-            .checked_add(self.compressed_size)
-            .ok_or(Error::Bounds)?;
+        let data_end = add(data_start, self.compressed_size)?;
         if data_end > self.archive.size() {
             return Err(Error::Truncated);
         }
@@ -637,7 +626,7 @@ fn read_variable_range<'a, R: Reader>(
 ) -> Result<&'a [u8], Error<R::Error>> {
     let len = range_len_usize(&range).map_err(Error::from)?;
     if buf.len() < len {
-        return Err(Error::Bounds);
+        return Err(Error::InvalidOffset);
     }
     archive.read_exact_at(range.start, &mut buf[..len])?;
     Ok(&buf[..len])
@@ -651,9 +640,11 @@ fn find_path_file_name_start<R: Reader>(
     let mut scratch = [0u8; PATH_SCAN_CHUNK_LEN];
 
     while cursor > path_range.start {
-        let remaining = cursor.checked_sub(path_range.start).ok_or(Error::Bounds)?;
+        let remaining = cursor
+            .checked_sub(path_range.start)
+            .ok_or(Error::InvalidOffset)?;
         let chunk_len_u64 = remaining.min(PATH_SCAN_CHUNK_LEN as u64);
-        let chunk_len = usize::try_from(chunk_len_u64).map_err(|_| Error::Bounds)?;
+        let chunk_len = usize::try_from(chunk_len_u64).map_err(|_| Error::InvalidOffset)?;
         let chunk_start = cursor - chunk_len_u64;
         archive.read_exact_at(chunk_start, &mut scratch[..chunk_len])?;
 
@@ -708,7 +699,7 @@ fn find_eocd<R: Reader>(reader: &R, size: u64) -> Result<(u64, Eocd), Error<R::E
     }
 
     let window_u64 = size.min(MAX_EOCD_SCAN as u64);
-    let window = usize::try_from(window_u64).map_err(|_| Error::Bounds)?;
+    let window = usize::try_from(window_u64).map_err(|_| Error::InvalidOffset)?;
     let start = size - window_u64;
     let mut buffer = [0u8; MAX_EOCD_SCAN];
     let buf = &mut buffer[..window];
@@ -761,11 +752,7 @@ fn parse_zip64_metadata<R: Reader>(
 
     let zip64_offset = resolve_zip64_record_offset(reader, size, locator_offset, zip64_offset)?;
     let mut header = [0u8; 56];
-    if zip64_offset
-        .checked_add(header.len() as u64)
-        .ok_or(Error::Bounds)?
-        > size
-    {
+    if add(zip64_offset, header.len() as u64)? > size {
         return Err(Error::Truncated);
     }
     reader
@@ -776,8 +763,8 @@ fn parse_zip64_metadata<R: Reader>(
     }
 
     let record_size = le_u64(&header[4..12]);
-    let total_len = record_size.checked_add(12).ok_or(Error::Bounds)?;
-    if zip64_offset.checked_add(total_len).ok_or(Error::Bounds)? > size {
+    let total_len = add(record_size, 12)?;
+    if add(zip64_offset, total_len)? > size {
         return Err(Error::Truncated);
     }
 
@@ -804,8 +791,10 @@ fn resolve_zip64_record_offset<R: Reader>(
     }
 
     let start = locator_offset.saturating_sub(SEARCH_WINDOW as u64);
-    let window = locator_offset.checked_sub(start).ok_or(Error::Bounds)?;
-    let window_usize = usize::try_from(window).map_err(|_| Error::Bounds)?;
+    let window = locator_offset
+        .checked_sub(start)
+        .ok_or(Error::InvalidOffset)?;
+    let window_usize = usize::try_from(window).map_err(|_| Error::InvalidOffset)?;
     let mut buffer = [0u8; SEARCH_WINDOW];
     reader
         .read_exact_at(start, &mut buffer[..window_usize])
@@ -830,9 +819,7 @@ fn resolve_central_directory_offset<R: Reader>(
     inferred_base_offset: u64,
 ) -> Result<u64, Error<R::Error>> {
     let raw_offset = central_directory_offset;
-    let inferred_offset = inferred_base_offset
-        .checked_add(central_directory_offset)
-        .ok_or(Error::Bounds)?;
+    let inferred_offset = add(inferred_base_offset, central_directory_offset)?;
 
     let raw_valid = looks_like_central_header(reader, size, raw_offset)?;
     let inferred_valid = looks_like_central_header(reader, size, inferred_offset)?;
@@ -928,6 +915,10 @@ fn ensure_single_disk<E>(disk_number: u32, central_directory_disk: u32) -> Resul
         return Err(Error::MultiDisk);
     }
     Ok(())
+}
+
+fn add<E>(lhs: u64, rhs: u64) -> Result<u64, Error<E>> {
+    lhs.checked_add(rhs).ok_or(Error::InvalidOffset)
 }
 
 fn central_record_len(name_len: u64, extra_len: u64, comment_len: u64) -> Option<u64> {

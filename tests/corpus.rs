@@ -634,7 +634,6 @@ fn structural_err<E>(err: &Error<E>) -> Error<()> {
         Error::InvalidSignature => Error::InvalidSignature,
         Error::InvalidOffset => Error::InvalidOffset,
         Error::InvalidRecord => Error::InvalidRecord,
-        Error::Bounds => Error::Bounds,
         Error::MultiDisk => Error::MultiDisk,
         Error::StrongEncryption => Error::StrongEncryption,
         Error::MaskedLocalHeaders => Error::MaskedLocalHeaders,

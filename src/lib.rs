@@ -552,16 +552,12 @@ impl<'a, R: Reader> Entry<'a, R> {
     }
 
     /// Returns the compressed payload size in bytes.
-    ///
-    /// ZIP64 values are reported losslessly as `u64`.
     #[must_use]
     pub fn compressed_size(&self) -> u64 {
         self.compressed_size
     }
 
     /// Returns the uncompressed payload size in bytes.
-    ///
-    /// ZIP64 values are reported losslessly as `u64`.
     #[must_use]
     pub fn uncompressed_size(&self) -> u64 {
         self.uncompressed_size

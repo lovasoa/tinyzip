@@ -14,3 +14,7 @@ std = []
 path = "src/lib.rs"
 
 [dependencies]
+
+[dev-dependencies]
+miniz_oxide = "0.8"
+flate2 = "1"

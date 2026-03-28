@@ -1,4 +1,4 @@
-use crate::Reader;
+use crate::{Archive, Entry, Reader};
 use core::cell::RefCell;
 use std::fs::File;
 use std::io::{Error, Read, Seek, SeekFrom};
@@ -84,5 +84,54 @@ impl Reader for UnixFileReader {
         use std::os::unix::fs::FileExt;
 
         self.inner.read_exact_at(buf, pos)
+    }
+}
+
+/// A [`Read`] adapter over an entry's payload bytes.
+///
+/// Created by [`Entry::reader`]. Each [`read`](Read::read) call performs a
+/// positioned read on the underlying archive, so the reader is not buffered.
+pub struct EntryReader<'a, R> {
+    archive: &'a Archive<R>,
+    pos: u64,
+    end: u64,
+}
+
+impl<'a, R: Reader> Read for EntryReader<'a, R>
+where
+    R::Error: Into<Error>,
+{
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = (self.end - self.pos) as usize;
+        let to_read = buf.len().min(remaining);
+        if to_read == 0 {
+            return Ok(0);
+        }
+        self.archive
+            .reader
+            .read_exact_at(self.pos, &mut buf[..to_read])
+            .map_err(Into::into)?;
+        self.pos += to_read as u64;
+        Ok(to_read)
+    }
+}
+
+impl<'a, R: Reader> Entry<'a, R> {
+    /// Returns a [`Read`] adapter over this entry's payload bytes.
+    ///
+    /// The adapter reads raw stored or compressed bytes from the archive;
+    /// decompression is the caller's responsibility.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structural [`crate::Error`] if the local header is malformed
+    /// or the data range extends past the archive.
+    pub fn reader(&self) -> Result<EntryReader<'a, R>, crate::Error<R::Error>> {
+        let range = self.data_range()?;
+        Ok(EntryReader {
+            archive: self.archive,
+            pos: range.data_range.start,
+            end: range.data_range.end,
+        })
     }
 }

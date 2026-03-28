@@ -11,7 +11,7 @@ You can decompress them with an external crate like [miniz_oxide](https://docs.r
 
 A ZIP archive has the following overall structure:
 
-```
+```text
 [local file header 1] [file data 1]
 [local file header 2] [file data 2]
 ...
@@ -75,22 +75,19 @@ maintained by PKWARE.
 
 ### no_std
 
-```rust
-use tinyzip::{Archive, Reader};
-use miniz_oxide::decompress_slice_iter_to_slice;
+```rust,ignore
+use tinyzip::{Archive, Compression};
+use miniz_oxide::inflate::decompress_slice_iter_to_slice;
 
-let mut files = Archive::from(file_bytes)?.files();
-while let Ok(file) = files.next() {
-    if file.path_is("test.txt") {
-        let mut decompressed = [0u8; MAX_DECOMPRESSED_SIZE];
-        match file.compression()? {
-            Deflated => {
-                let mut chunks = file.read_chunks::<512>();
-                decompress_slice_iter_to_slice(&mut decompressed, chunks, false, true)?;
-            }
-            Stored => { file.read_to_slice(&mut decompressed)?; }
-        }
+let archive = Archive::open(file_bytes)?;
+let entry = archive.find_file(b"test.txt")?;
+let mut decompressed = [0u8; MAX_DECOMPRESSED_SIZE];
+match entry.compression()? {
+    Compression::Deflated => {
+        let chunks = entry.read_chunks::<512>()?;
+        decompress_slice_iter_to_slice(&mut decompressed, chunks.iter(), false, false)?;
     }
+    Compression::Stored => { entry.read_to_slice(&mut decompressed)?; }
 }
 ```
 
@@ -99,18 +96,24 @@ while let Ok(file) = files.next() {
 When std is available this crate gives access to some features that require std traits or memory allocation.
 The core logic remains the same and does not allocate when opening a file or iterating through contents.
 
-```rust
+```rust,ignore
+use std::fs::File;
+use std::io;
+use tinyzip::{Archive, Compression};
+use tinyzip::std_io::ReadSeekReader;
+use flate2::read::DeflateDecoder;
+
 let zip_file = File::open("archive.zip")?;
-let inner_file = Archive::from(zip_file)?.find_file("test.txt");
-let mut outfile = File::open("test.txt");
-match inner_file.compression()? {
-    Deflate => {
-        let mut deflater = DeflateDecoder::new(outfile);
-        inner_file.write_to(&mut deflater)?;
-        deflater.finish()?
+let archive = Archive::open(ReadSeekReader::new(zip_file))?;
+let entry = archive.find_file(b"test.txt")?;
+let mut outfile = File::create("test.txt")?;
+match entry.compression()? {
+    Compression::Deflated => {
+        let mut decoder = DeflateDecoder::new(entry.reader()?);
+        io::copy(&mut decoder, &mut outfile)?;
     }
-    Stored => {
-        inner_file.write_to(outfile)?;
+    Compression::Stored => {
+        io::copy(&mut entry.reader()?, &mut outfile)?;
     }
 }
 ```

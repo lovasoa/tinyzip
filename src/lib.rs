@@ -1,10 +1,7 @@
 #![no_std]
 #![deny(missing_docs)]
-//! Low-level `no_std`, `no_alloc` ZIP navigation.
-//!
-//! The crate does not decompress data. It locates the central directory,
-//! iterates entries, and reports raw archive byte ranges for names, metadata,
-//! local headers, and payload bytes.
+#![cfg_attr(not(feature = "std"), deny(clippy::disallowed_types))]
+#![doc = include_str!("../README.md")]
 #![cfg_attr(test, allow(clippy::uninlined_format_args))]
 
 #[cfg(feature = "std")]
@@ -172,6 +169,8 @@ pub enum Error<E> {
     MaskedLocalHeaders,
     /// A compression method the crate does not support.
     UnsupportedCompression(u16),
+    /// No entry matched the requested path.
+    NotFound,
 }
 
 impl<E: fmt::Display> fmt::Display for Error<E> {
@@ -189,6 +188,7 @@ impl<E: fmt::Display> fmt::Display for Error<E> {
             Self::UnsupportedCompression(method) => {
                 write!(f, "unsupported ZIP compression method {method}")
             }
+            Self::NotFound => f.write_str("file not found in archive"),
         }
     }
 }
@@ -198,7 +198,7 @@ impl<E: fmt::Display> fmt::Display for Error<E> {
 /// The archive stores only fixed-size metadata. Entry records and local headers
 /// are re-read on demand.
 pub struct Archive<R> {
-    reader: R,
+    pub(crate) reader: R,
     size: u64,
     base_offset: u64,
     directory_end_offset: u64,
@@ -302,6 +302,23 @@ impl<R: Reader> Archive<R> {
         }
     }
 
+    /// Finds the first entry whose full path equals `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if no entry matches, and propagates any
+    /// parse or I/O error encountered during iteration.
+    pub fn find_file(&self, path: impl AsRef<[u8]>) -> Result<Entry<'_, R>, Error<R::Error>> {
+        let path = path.as_ref();
+        for entry in self.entries() {
+            let entry = entry?;
+            if entry.path_is(path)? {
+                return Ok(entry);
+            }
+        }
+        Err(Error::NotFound)
+    }
+
     fn read_exact_at(&self, pos: u64, buf: &mut [u8]) -> Result<(), Error<R::Error>> {
         let len = u64::try_from(buf.len()).map_err(|_| Error::InvalidOffset)?;
         if add(pos, len)? > self.size {
@@ -350,7 +367,7 @@ pub struct Entry<'a, R> {
     archive: &'a Archive<R>,
     name_range: Range<u64>,
     flags: u16,
-    compression: Compression,
+    compression_method: u16,
     crc32: u32,
     compressed_size: u64,
     uncompressed_size: u64,
@@ -425,14 +442,12 @@ impl<'a, R: Reader> Entry<'a, R> {
         }
 
         let compression_method = le_u16(&header[10..12]);
-        let compression = Compression::from_raw(compression_method)
-            .ok_or(Error::UnsupportedCompression(compression_method))?;
 
         let entry = Self {
             archive,
             name_range,
             flags,
-            compression,
+            compression_method,
             crc32: le_u32(&header[16..20]),
             compressed_size,
             uncompressed_size,
@@ -449,9 +464,14 @@ impl<'a, R: Reader> Entry<'a, R> {
     }
 
     /// Returns the compression method reported by the central directory.
-    #[must_use]
-    pub fn compression(&self) -> Compression {
-        self.compression
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedCompression`] if the method id is not
+    /// recognised by this crate.
+    pub fn compression(&self) -> Result<Compression, Error<R::Error>> {
+        Compression::from_raw(self.compression_method)
+            .ok_or(Error::UnsupportedCompression(self.compression_method))
     }
 
     /// Returns the CRC-32 reported by the central directory.
@@ -580,15 +600,116 @@ impl<'a, R: Reader> Entry<'a, R> {
             return Err(Error::Truncated);
         }
 
+        let compression = self.compression()?;
         Ok(DataRange {
             local_header_range: local_header_offset..data_start,
             local_name_range,
             local_extra_range,
             data_range: data_start..data_end,
-            kind: match self.compression {
+            kind: match compression {
                 Compression::Stored => DataKind::Stored,
                 other => DataKind::Compressed(other),
             },
+        })
+    }
+
+    /// Returns whether the full stored path equals `path`.
+    ///
+    /// This compares raw bytes only. It does not decode text, normalize path
+    /// separators, or resolve `.` / `..`. Comparison proceeds from the end
+    /// of the path for early termination when entries share a common prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structural [`Error`] if the stored path range is inconsistent,
+    /// and [`Error::Io`] if the underlying reads fail.
+    pub fn path_is(&self, path: impl AsRef<[u8]>) -> Result<bool, Error<R::Error>> {
+        let path = path.as_ref();
+        let path_len = u64::try_from(path.len()).map_err(|_| Error::InvalidOffset)?;
+        let stored_len = self
+            .name_range
+            .end
+            .checked_sub(self.name_range.start)
+            .ok_or(Error::InvalidOffset)?;
+        if stored_len != path_len {
+            return Ok(false);
+        }
+
+        let mut scratch = [0u8; PATH_SCAN_CHUNK_LEN];
+        let mut remaining = path.len();
+        while remaining > 0 {
+            let chunk_len = remaining.min(scratch.len());
+            let offset = remaining - chunk_len;
+            let archive_offset =
+                self.name_range.start + u64::try_from(offset).map_err(|_| Error::InvalidOffset)?;
+            self.archive
+                .read_exact_at(archive_offset, &mut scratch[..chunk_len])?;
+            if scratch[..chunk_len] != path[offset..offset + chunk_len] {
+                return Ok(false);
+            }
+            remaining = offset;
+        }
+        Ok(true)
+    }
+
+    /// Reads the entry's payload bytes into `buf`.
+    ///
+    /// The returned slice borrows `buf` and contains the raw stored or
+    /// compressed bytes. `buf` must be at least as large as the compressed
+    /// payload size.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidOffset`] if `buf` is too small, and
+    /// [`Error::Io`] if the underlying read fails.
+    pub fn read_to_slice<'b>(&self, buf: &'b mut [u8]) -> Result<&'b [u8], Error<R::Error>> {
+        let range = self.data_range()?;
+        let len = range_len_usize(&range.data_range)?;
+        if buf.len() < len {
+            return Err(Error::InvalidOffset);
+        }
+        self.archive
+            .read_exact_at(range.data_range.start, &mut buf[..len])?;
+        Ok(&buf[..len])
+    }
+}
+
+/// Chunked view over an entry's payload bytes in a byte-slice archive.
+///
+/// Created by [`Entry::read_chunks`]. Call [`iter`](Self::iter) to obtain a
+/// standard [`Iterator`] of `&[u8]` chunks suitable for streaming
+/// decompression.
+pub struct DataChunks<'a, const N: usize> {
+    data: &'a [u8],
+}
+
+impl<'a, const N: usize> DataChunks<'a, N> {
+    /// Returns an iterator of `&[u8]` chunks of at most `N` bytes.
+    pub fn iter(&self) -> core::slice::Chunks<'a, u8> {
+        self.data.chunks(N)
+    }
+}
+
+impl<'a> Entry<'a, &'a [u8]> {
+    /// Returns a chunked view over the entry's payload bytes.
+    ///
+    /// Because the archive is backed by a byte slice, the payload is already
+    /// in memory. The returned [`DataChunks`] yields sub-slices of at most `N`
+    /// bytes, suitable for passing to streaming decompressors such as
+    /// `miniz_oxide::inflate::decompress_slice_iter_to_slice`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structural [`Error`] if the local header is malformed or the
+    /// data range extends past the archive.
+    pub fn read_chunks<const N: usize>(
+        &self,
+    ) -> Result<DataChunks<'a, N>, Error<SliceReaderError>> {
+        let range = self.data_range()?;
+        let start = usize::try_from(range.data_range.start).map_err(|_| Error::InvalidOffset)?;
+        let end = usize::try_from(range.data_range.end).map_err(|_| Error::InvalidOffset)?;
+        Ok(DataChunks {
+            data: &self.archive.reader[start..end],
         })
     }
 }

@@ -494,14 +494,14 @@ fn assert_entry_matches(
         format_name(&name)
     );
     assert_eq!(
-        entry.compression(),
+        entry.compression().unwrap(),
         expected.compression,
         "fixture {} entry {} (name {}): compression mismatch, expected {:?}, got {:?}",
         label,
         entry_index,
         format_name(&name),
         expected.compression,
-        entry.compression()
+        entry.compression().unwrap()
     );
     assert_eq!(
         entry.compressed_size(),
@@ -534,7 +534,8 @@ fn assert_coherent_data_range(
     data: &tinyzip::DataRange,
 ) {
     let name = entry_name(label, entry_index, entry);
-    let expected_kind = match entry.compression() {
+    let compression = entry.compression().unwrap();
+    let expected_kind = match compression {
         Compression::Stored => DataKind::Stored,
         other => DataKind::Compressed(other),
     };
@@ -638,6 +639,7 @@ fn structural_err<E>(err: &Error<E>) -> Error<()> {
         Error::StrongEncryption => Error::StrongEncryption,
         Error::MaskedLocalHeaders => Error::MaskedLocalHeaders,
         Error::UnsupportedCompression(method) => Error::UnsupportedCompression(*method),
+        Error::NotFound => Error::NotFound,
     }
 }
 
@@ -731,3 +733,144 @@ fn to_u32(value: usize) -> u32 {
 }
 
 const PATH_BUF_LEN: usize = u16::MAX as usize;
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xEDB8_8320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
+}
+
+// --- path_is tests ---
+
+#[test]
+fn synthetic_path_is_full_match() {
+    let bytes = simple_stored_zip(b"dir/file.txt", b"payload");
+    let archive = Archive::open(bytes.as_slice()).unwrap();
+    let entry = archive.entries().next().unwrap().unwrap();
+    assert!(entry.path_is(b"dir/file.txt").unwrap());
+    assert!(entry.path_is("dir/file.txt").unwrap());
+    assert!(!entry.path_is(b"file.txt").unwrap());
+    assert!(!entry.path_is(b"dir/file.tx").unwrap());
+    assert!(!entry.path_is(b"dir/file.txtz").unwrap());
+    assert!(!entry.path_is(b"other/file.txt").unwrap());
+}
+
+// --- find_file tests ---
+
+#[test]
+fn find_file_in_corpus() {
+    let bytes = read_fixture("tests/data/manual/go-archive-zip/test.zip");
+    let archive = Archive::open(bytes.as_slice()).unwrap();
+    let entry = archive.find_file(b"test.txt").unwrap();
+    assert_eq!(entry.compressed_size(), 25);
+    assert_eq!(entry.uncompressed_size(), 26);
+}
+
+#[test]
+fn find_file_not_found() {
+    let bytes = read_fixture("tests/data/manual/go-archive-zip/test.zip");
+    let archive = Archive::open(bytes.as_slice()).unwrap();
+    let err = archive
+        .find_file(b"nonexistent.txt")
+        .err()
+        .expect("expected NotFound error");
+    assert_eq!(structural_err(&err), Error::NotFound);
+}
+
+// --- read_to_slice tests ---
+
+#[test]
+fn read_stored_entry_to_slice() {
+    let bytes = read_fixture("tests/data/manual/go-archive-zip/go-with-datadesc-sig.zip");
+    let archive = Archive::open(bytes.as_slice()).unwrap();
+    let entry = archive.find_file(b"foo.txt").unwrap();
+    assert_eq!(entry.compression().unwrap(), Compression::Stored);
+    let mut buf = [0u8; 64];
+    let data = entry.read_to_slice(&mut buf).unwrap();
+    assert_eq!(data, b"foo\n");
+    assert_eq!(crc32(data), entry.crc32());
+}
+
+// --- read_chunks + decompress tests (miniz_oxide) ---
+
+#[test]
+fn decompress_deflated_with_miniz_oxide() {
+    use miniz_oxide::inflate::decompress_slice_iter_to_slice;
+
+    let bytes = read_fixture("tests/data/manual/go-archive-zip/test.zip");
+    let archive = Archive::open(bytes.as_slice()).unwrap();
+    let entry = archive.find_file(b"test.txt").unwrap();
+    assert_eq!(entry.compression().unwrap(), Compression::Deflated);
+
+    let chunks = entry.read_chunks::<512>().unwrap();
+    let mut decompressed = [0u8; 256];
+    let n = decompress_slice_iter_to_slice(&mut decompressed, chunks.iter(), false, false).unwrap();
+    assert_eq!(n, 26);
+    assert_eq!(&decompressed[..n], b"This is a test text file.\n");
+    assert_eq!(crc32(&decompressed[..n]), entry.crc32());
+}
+
+#[test]
+fn read_stored_with_read_chunks() {
+    let bytes = read_fixture("tests/data/manual/go-archive-zip/go-with-datadesc-sig.zip");
+    let archive = Archive::open(bytes.as_slice()).unwrap();
+    let entry = archive.find_file(b"bar.txt").unwrap();
+    assert_eq!(entry.compression().unwrap(), Compression::Stored);
+
+    let chunks = entry.read_chunks::<2>().unwrap();
+    let collected: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+    assert_eq!(collected, b"bar\n");
+    assert_eq!(crc32(&collected), entry.crc32());
+}
+
+// --- EntryReader + flate2 tests (std feature) ---
+
+#[cfg(feature = "std")]
+mod std_tests {
+    use super::*;
+    use std::io::Read;
+    use tinyzip::std_io::ReadSeekReader;
+
+    #[test]
+    fn decompress_deflated_with_flate2() {
+        use flate2::read::DeflateDecoder;
+
+        let file_bytes = read_fixture("tests/data/manual/go-archive-zip/test.zip");
+        let reader = ReadSeekReader::new(std::io::Cursor::new(file_bytes));
+        let archive = Archive::open(reader).unwrap();
+        let entry = archive.find_file(b"test.txt").unwrap();
+        assert_eq!(entry.compression().unwrap(), Compression::Deflated);
+
+        let entry_reader = entry.reader().unwrap();
+        let mut decoder = DeflateDecoder::new(entry_reader);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed).unwrap();
+        assert_eq!(decompressed.len(), 26);
+        assert_eq!(decompressed, b"This is a test text file.\n");
+        assert_eq!(crc32(&decompressed), entry.crc32());
+    }
+
+    #[test]
+    fn reader_stored_io_copy() {
+        let file_bytes = read_fixture("tests/data/manual/go-archive-zip/go-with-datadesc-sig.zip");
+        let reader = ReadSeekReader::new(std::io::Cursor::new(file_bytes));
+        let archive = Archive::open(reader).unwrap();
+        let entry = archive.find_file(b"foo.txt").unwrap();
+        assert_eq!(entry.compression().unwrap(), Compression::Stored);
+
+        let mut entry_reader = entry.reader().unwrap();
+        let mut output = Vec::new();
+        std::io::copy(&mut entry_reader, &mut output).unwrap();
+        assert_eq!(output, b"foo\n");
+        assert_eq!(crc32(&output), entry.crc32());
+    }
+}

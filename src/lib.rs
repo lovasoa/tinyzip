@@ -67,6 +67,9 @@ impl fmt::Display for SliceReaderError {
     }
 }
 
+#[cfg(feature = "std")]
+impl std::error::Error for SliceReaderError {}
+
 impl Reader for &[u8] {
     type Error = SliceReaderError;
 
@@ -189,6 +192,16 @@ impl<E: fmt::Display> fmt::Display for Error<E> {
                 write!(f, "unsupported ZIP compression method {method}")
             }
             Self::NotFound => f.write_str("file not found in archive"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl<E: std::error::Error + 'static> std::error::Error for Error<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            _ => None,
         }
     }
 }
@@ -672,45 +685,92 @@ impl<'a, R: Reader> Entry<'a, R> {
             .read_exact_at(range.data_range.start, &mut buf[..len])?;
         Ok(&buf[..len])
     }
-}
 
-/// Chunked view over an entry's payload bytes in a byte-slice archive.
-///
-/// Created by [`Entry::read_chunks`]. Call [`iter`](Self::iter) to obtain a
-/// standard [`Iterator`] of `&[u8]` chunks suitable for streaming
-/// decompression.
-pub struct DataChunks<'a, const N: usize> {
-    data: &'a [u8],
-}
-
-impl<'a, const N: usize> DataChunks<'a, N> {
-    /// Returns an iterator of `&[u8]` chunks of at most `N` bytes.
-    pub fn iter(&self) -> core::slice::Chunks<'a, u8> {
-        self.data.chunks(N)
-    }
-}
-
-impl<'a> Entry<'a, &'a [u8]> {
-    /// Returns a chunked view over the entry's payload bytes.
+    /// Returns a chunked reader over this entry's payload bytes.
     ///
-    /// Because the archive is backed by a byte slice, the payload is already
-    /// in memory. The returned [`DataChunks`] yields sub-slices of at most `N`
-    /// bytes, suitable for passing to streaming decompressors such as
-    /// `miniz_oxide::inflate::decompress_slice_iter_to_slice`.
+    /// Each call to [`DataChunks::next`] reads up to `N` bytes into an
+    /// internal buffer and returns a reference to the filled portion.
+    /// This works with any [`Reader`], not just in-memory byte slices.
     ///
     /// # Errors
     ///
     /// Returns a structural [`Error`] if the local header is malformed or the
     /// data range extends past the archive.
-    pub fn read_chunks<const N: usize>(
-        &self,
-    ) -> Result<DataChunks<'a, N>, Error<SliceReaderError>> {
+    pub fn read_chunks<const N: usize>(&self) -> Result<DataChunks<'a, R, N>, Error<R::Error>> {
         let range = self.data_range()?;
-        let start = usize::try_from(range.data_range.start).map_err(|_| Error::InvalidOffset)?;
-        let end = usize::try_from(range.data_range.end).map_err(|_| Error::InvalidOffset)?;
         Ok(DataChunks {
-            data: &self.archive.reader[start..end],
+            archive: self.archive,
+            buf: [0u8; N],
+            pos: range.data_range.start,
+            end: range.data_range.end,
         })
+    }
+}
+
+/// Lending iterator over an entry's payload bytes in fixed-size chunks.
+///
+/// Created by [`Entry::read_chunks`]. Each call to [`next`](Self::next)
+/// fills an internal `[u8; N]` buffer and returns a reference to the
+/// filled portion. The previous chunk's reference is invalidated on each
+/// call.
+pub struct DataChunks<'a, R, const N: usize> {
+    archive: &'a Archive<R>,
+    buf: [u8; N],
+    pos: u64,
+    end: u64,
+}
+
+impl<'a, R: Reader, const N: usize> DataChunks<'a, R, N> {
+    /// Reads the next chunk of up to `N` bytes.
+    ///
+    /// Returns `None` when the payload has been fully read.
+    /// Each returned `&[u8]` borrows the internal buffer and is
+    /// invalidated by the next call.
+    ///
+    /// This is a lending iterator — it cannot implement [`Iterator`] because
+    /// the returned slice borrows from `self`. Use a `while let` loop:
+    /// ```
+    /// let zip_bytes = include_bytes!("../tests/data/manual/go-archive-zip/test.zip");
+    /// let archive = tinyzip::Archive::open(zip_bytes.as_slice()).unwrap();
+    /// let entry = archive.find_file(b"test.txt").unwrap();
+    /// let mut chunks = entry.read_chunks::<512>().unwrap();
+    /// while let Some(chunk) = chunks.next() {
+    ///     let _data = chunk.unwrap();
+    /// }
+    /// ```
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Option<Result<&[u8], Error<R::Error>>> {
+        if self.pos >= self.end {
+            return None;
+        }
+        let remaining = (self.end - self.pos) as usize;
+        let chunk_len = remaining.min(N);
+        match self
+            .archive
+            .read_exact_at(self.pos, &mut self.buf[..chunk_len])
+        {
+            Ok(()) => {
+                self.pos += chunk_len as u64;
+                Some(Ok(&self.buf[..chunk_len]))
+            }
+            Err(e) => {
+                self.pos = self.end;
+                Some(Err(e))
+            }
+        }
+    }
+}
+
+impl<'a, const N: usize> DataChunks<'a, &'a [u8], N> {
+    /// Returns a standard [`Iterator`] over `&[u8]` chunks.
+    ///
+    /// This is available only when the archive is backed by a byte slice,
+    /// since the payload is already in memory and can be referenced directly.
+    /// All returned slices share the lifetime of the underlying byte slice.
+    pub fn iter(&self) -> core::slice::Chunks<'a, u8> {
+        let start = self.pos as usize;
+        let end = self.end as usize;
+        self.archive.reader[start..end].chunks(N)
     }
 }
 

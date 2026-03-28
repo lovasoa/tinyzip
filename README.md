@@ -75,20 +75,36 @@ maintained by PKWARE.
 
 ### no_std
 
-```rust,ignore
+```rust
+# fn main() {
+#     let file_bytes: &[u8] = include_bytes!("tests/data/manual/go-archive-zip/test.zip");
+#     run(file_bytes).unwrap();
+# }
+# fn run(file_bytes: &[u8]) -> Result<(), tinyzip::Error<tinyzip::SliceReaderError>> {
 use tinyzip::{Archive, Compression};
-use miniz_oxide::inflate::decompress_slice_iter_to_slice;
+use miniz_oxide::inflate::stream::{inflate, InflateState};
+use miniz_oxide::{DataFormat, MZFlush};
 
 let archive = Archive::open(file_bytes)?;
 let entry = archive.find_file(b"test.txt")?;
-let mut decompressed = [0u8; MAX_DECOMPRESSED_SIZE];
-match entry.compression()? {
+let mut decompressed = [0u8; 1024];
+let contents = match entry.compression()? {
     Compression::Deflated => {
-        let chunks = entry.read_chunks::<512>()?;
-        decompress_slice_iter_to_slice(&mut decompressed, chunks.iter(), false, false)?;
+        let mut chunks = entry.read_chunks::<512>()?;
+        let mut state = InflateState::new(DataFormat::Raw);
+        let mut out_pos = 0;
+        while let Some(chunk) = chunks.next() {
+            let result = inflate(&mut state, chunk?,
+                &mut decompressed[out_pos..], MZFlush::None);
+            out_pos += result.bytes_written;
+        }
+        &decompressed[..out_pos]
     }
-    Compression::Stored => { entry.read_to_slice(&mut decompressed)?; }
-}
+    Compression::Stored => { entry.read_to_slice(&mut decompressed)? }
+};
+assert_eq!(contents, b"This is a test text file.\n");
+# Ok(())
+# }
 ```
 
 ### `std` feature
@@ -96,7 +112,9 @@ match entry.compression()? {
 When std is available this crate gives access to some features that require std traits or memory allocation.
 The core logic remains the same and does not allocate when opening a file or iterating through contents.
 
-```rust,ignore
+```rust,no_run
+# #[cfg(feature = "std")]
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 use std::fs::File;
 use std::io;
 use tinyzip::{Archive, Compression};
@@ -116,6 +134,10 @@ match entry.compression()? {
         io::copy(&mut entry.reader()?, &mut outfile)?;
     }
 }
+# Ok(())
+# }
+# #[cfg(not(feature = "std"))]
+# fn main() {}
 ```
 
 ## API details

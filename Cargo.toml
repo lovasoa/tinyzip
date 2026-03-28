@@ -8,13 +8,15 @@ repository = "https://github.com/lovasoa/tinyzip"
 
 [features]
 default = []
-std = []
+std = ["flate2?/default"]
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
+miniz_oxide = { version = "0.8", optional = true, default-features = false }
+flate2 = { version = "1", optional = true }
 
 [dev-dependencies]
-miniz_oxide = "0.8"
+miniz_oxide = { version = "0.8", default-features = false }
 flate2 = "1"

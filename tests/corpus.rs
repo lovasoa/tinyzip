@@ -811,23 +811,29 @@ fn decompress_deflated_with_miniz_oxide() {
     let entry = archive.find_file(b"test.txt").unwrap();
     assert_eq!(entry.compression().unwrap(), Compression::Deflated);
 
-    let chunks = entry.read_chunks::<512>().unwrap();
+    // Read compressed data into a buffer, then chunk it for the decompressor
+    let mut compressed = [0u8; 256];
+    let data = entry.read_to_slice(&mut compressed).unwrap();
     let mut decompressed = [0u8; 256];
-    let n = decompress_slice_iter_to_slice(&mut decompressed, chunks.iter(), false, false).unwrap();
+    let n =
+        decompress_slice_iter_to_slice(&mut decompressed, data.chunks(512), false, false).unwrap();
     assert_eq!(n, 26);
     assert_eq!(&decompressed[..n], b"This is a test text file.\n");
     assert_eq!(crc32(&decompressed[..n]), entry.crc32());
 }
 
 #[test]
-fn read_stored_with_read_chunks() {
+fn read_chunks_lending_iterator() {
     let bytes = read_fixture("tests/data/manual/go-archive-zip/go-with-datadesc-sig.zip");
     let archive = Archive::open(bytes.as_slice()).unwrap();
     let entry = archive.find_file(b"bar.txt").unwrap();
     assert_eq!(entry.compression().unwrap(), Compression::Stored);
 
-    let chunks = entry.read_chunks::<2>().unwrap();
-    let collected: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+    let mut chunks = entry.read_chunks::<2>().unwrap();
+    let mut collected = Vec::new();
+    while let Some(chunk) = chunks.next() {
+        collected.extend_from_slice(chunk.unwrap());
+    }
     assert_eq!(collected, b"bar\n");
     assert_eq!(crc32(&collected), entry.crc32());
 }

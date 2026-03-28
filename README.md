@@ -115,31 +115,31 @@ assert_eq!(contents, b"This is a test text file.\n");
 When `std` is available, this crate unlocks features that require `std` traits or heap allocation.
 The core logic remains the same and does not allocate when opening a file or iterating through contents.
 
-```rust,no_run
-# #[cfg(feature = "std")]
+```rust
 # fn main() -> Result<(), Box<dyn core::error::Error>> {
+# #[cfg(feature = "std")] { // this test requires std
+# let zip_path = "tests/data/manual/go-archive-zip/test.zip";
 use std::fs::File;
 use std::io;
 use tinyzip::{Archive, Compression};
 use flate2::read::DeflateDecoder;
 
-let zip_file = File::open("archive.zip")?;
+let zip_file = File::open(zip_path)?;
 let archive = Archive::try_from(zip_file)?;
 let entry = archive.find_file(b"test.txt")?;
-let mut outfile = File::create("test.txt")?;
+// This can be a `File` if you want to extract to disk.
+let mut writer = Vec::new();
 match entry.compression()? {
     Compression::Deflated => {
         let mut decoder = DeflateDecoder::new(entry.reader()?);
-        io::copy(&mut decoder, &mut outfile)?;
+        io::copy(&mut decoder, &mut writer)?;
     }
     Compression::Stored => {
-        io::copy(&mut entry.reader()?, &mut outfile)?;
+        io::copy(&mut entry.reader()?, &mut writer)?;
     }
 }
-# Ok(())
-# }
-# #[cfg(not(feature = "std"))]
-# fn main() {}
+# assert_eq!(writer, b"This is a test text file.\n");
+# } Ok(()) }
 ```
 
 ## API details

@@ -117,15 +117,14 @@ The core logic remains the same and does not allocate when opening a file or ite
 
 ```rust,no_run
 # #[cfg(feature = "std")]
-# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# fn main() -> Result<(), Box<dyn core::error::Error>> {
 use std::fs::File;
 use std::io;
 use tinyzip::{Archive, Compression};
-use tinyzip::std_io::ReadSeekReader;
 use flate2::read::DeflateDecoder;
 
 let zip_file = File::open("archive.zip")?;
-let archive = Archive::open(ReadSeekReader::new(zip_file))?;
+let archive = Archive::try_from(zip_file)?;
 let entry = archive.find_file(b"test.txt")?;
 let mut outfile = File::create("test.txt")?;
 match entry.compression()? {

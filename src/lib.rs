@@ -68,7 +68,7 @@ impl fmt::Display for SliceReaderError {
 }
 
 #[cfg(feature = "std")]
-impl std::error::Error for SliceReaderError {}
+impl core::error::Error for SliceReaderError {}
 
 impl Reader for &[u8] {
     type Error = SliceReaderError;
@@ -197,8 +197,8 @@ impl<E: fmt::Display> fmt::Display for Error<E> {
 }
 
 #[cfg(feature = "std")]
-impl<E: std::error::Error + 'static> std::error::Error for Error<E> {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl<E: core::error::Error + 'static> core::error::Error for Error<E> {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
             _ => None,
@@ -338,6 +338,15 @@ impl<R: Reader> Archive<R> {
             return Err(Error::Truncated);
         }
         self.reader.read_exact_at(pos, buf).map_err(Error::Io)
+    }
+}
+
+#[cfg(feature = "std")]
+impl TryFrom<std::fs::File> for Archive<crate::std_io::FileReader> {
+    type Error = Error<std::io::Error>;
+
+    fn try_from(file: std::fs::File) -> Result<Self, Self::Error> {
+        Self::open(crate::std_io::FileReader::from(file))
     }
 }
 

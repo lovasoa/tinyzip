@@ -11,6 +11,12 @@ pub struct ReadSeekReader<T> {
     inner: RefCell<T>,
 }
 
+impl<T> From<T> for ReadSeekReader<T> {
+    fn from(inner: T) -> Self {
+        Self::new(inner)
+    }
+}
+
 impl<T> ReadSeekReader<T> {
     /// Wraps a `Read + Seek` source.
     #[must_use]
@@ -58,6 +64,13 @@ pub struct UnixFileReader {
 }
 
 #[cfg(unix)]
+impl From<File> for UnixFileReader {
+    fn from(inner: File) -> Self {
+        Self::new(inner)
+    }
+}
+
+#[cfg(unix)]
 impl UnixFileReader {
     /// Wraps a file for immutable positioned reads.
     #[must_use]
@@ -86,6 +99,14 @@ impl Reader for UnixFileReader {
         self.inner.read_exact_at(buf, pos)
     }
 }
+
+#[cfg(unix)]
+/// Platform-optimized reader for [`std::fs::File`].
+pub type FileReader = UnixFileReader;
+
+#[cfg(not(unix))]
+/// Platform-optimized reader for [`std::fs::File`].
+pub type FileReader = ReadSeekReader<File>;
 
 /// A [`Read`] adapter over an entry's payload bytes.
 ///

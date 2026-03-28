@@ -843,6 +843,8 @@ fn read_chunks_lending_iterator() {
 #[cfg(feature = "std")]
 mod std_tests {
     use super::*;
+    use std::fs;
+    use std::fs::File;
     use std::io::Read;
     use tinyzip::std_io::ReadSeekReader;
 
@@ -878,5 +880,32 @@ mod std_tests {
         std::io::copy(&mut entry_reader, &mut output).unwrap();
         assert_eq!(output, b"foo\n");
         assert_eq!(crc32(&output), entry.crc32());
+    }
+
+    #[test]
+    fn open_archive_from_file_without_manual_wrapper() {
+        let file_bytes = read_fixture("tests/data/manual/go-archive-zip/test.zip");
+        let path = std::env::temp_dir().join(format!(
+            "tinyzip-open-{}-{}.zip",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, file_bytes).unwrap();
+
+        let result = (|| {
+            let zip_file = File::open(&path).unwrap();
+            let archive = Archive::try_from(zip_file).unwrap();
+            let entry = archive.find_file(b"test.txt").unwrap();
+            let mut decoder = flate2::read::DeflateDecoder::new(entry.reader().unwrap());
+            let mut decompressed = Vec::new();
+            decoder.read_to_end(&mut decompressed).unwrap();
+            assert_eq!(decompressed, b"This is a test text file.\n");
+        })();
+
+        fs::remove_file(&path).unwrap();
+        result
     }
 }

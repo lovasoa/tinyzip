@@ -1,5 +1,8 @@
 # tinyzip
 
+[![crates.io](https://img.shields.io/crates/v/tinyzip.svg)](https://crates.io/crates/tinyzip)
+[![docs.rs](https://img.shields.io/docsrs/tinyzip.svg)](https://docs.rs/tinyzip)
+
 `tinyzip` is a `no_std` low level ZIP navigation library for Rust.
 It does not have any dependency and does not allocate memory.
 
@@ -109,7 +112,7 @@ assert_eq!(contents, b"This is a test text file.\n");
 
 ### `std` feature
 
-When std is available this crate gives access to some features that require std traits or memory allocation.
+When `std` is available, this crate unlocks features that require `std` traits or heap allocation.
 The core logic remains the same and does not allocate when opening a file or iterating through contents.
 
 ```rust,no_run

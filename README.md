@@ -127,8 +127,7 @@ use flate2::read::DeflateDecoder;
 let zip_file = File::open(zip_path)?;
 let archive = Archive::try_from(zip_file)?;
 let entry = archive.find_file(b"test.txt")?;
-// This can be a `File` if you want to extract to disk.
-let mut writer = Vec::new();
+let mut writer = Vec::new(); // This could be be a `std::fs::File`
 match entry.compression()? {
     Compression::Deflated => {
         let mut decoder = DeflateDecoder::new(entry.reader()?);
